@@ -144,20 +144,22 @@ fn point_at_parameter(r: ptr<function,ray>, t: f32) -> vec3<f32> {
 }
 
 // hit
-fn hit_sphere(center: ptr<function, vec3<f32>>, radius: f32, r: ptr<function,ray>) -> bool {
+fn hit_sphere(center: ptr<function, vec3<f32>>, radius: f32, r: ptr<function,ray>) -> f32 {
   var oc = (*r).origin - *center;
   var a = dot((*r).direction, (*r).direction);
   var b = 2.0 * dot(oc, (*r).direction);
   var c = dot(oc, oc) - radius * radius;
   var discriminant = b * b - 4.0 * a * c;
-  return discriminant > 0.0;
+  return select ((-b - sqrt(discriminant)) / (2.0 * a), -1.0, discriminant < 0.0);
 }
 
 // color
 fn color(r: ptr<function,ray>) -> vec3<f32> {
   var center = vec3<f32>(0.0, 0.0, -1.0);
-  if (hit_sphere(&center, 0.5, r)) {
-    return vec3<f32>(1.0, 0.0, 0.0);
+  var hs = hit_sphere(&center, 0.5, r);
+  if (hs > 0.0) {
+    var normal = normalize(point_at_parameter(r, hs) - center);
+    return 0.5 * vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0);
   }
   var unit_direction = normalize((*r).direction);
   var t = 0.5 * (unit_direction.y + 1.0);
