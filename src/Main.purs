@@ -116,12 +116,17 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       frenchFlagDesc = x
         { code:
             """
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+  return a + (b - a) * t;
+}
+
 struct rendering_info_struct {
   real_canvas_width: u32, // width of the canvas in pixels
   overshot_canvas_width: u32, // width of the canvas in pixels so that the byte count per pixel is a multiple of 256
   canvas_height: u32, // height of the canvas in pixels
   current_time: f32 // current time in seconds
 }
+const pi = 3.141592653589793;
 
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read_write> resultMatrix : array<u32>;
@@ -131,15 +136,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     return;
   }
   var bound = ((global_id.x / rendering_info.real_canvas_width) * rendering_info.overshot_canvas_width) + (global_id.x % rendering_info.real_canvas_width) ;
-  var bmw = global_id.x % rendering_info.real_canvas_width;
-  var bmh = global_id.x / rendering_info.real_canvas_width;
+  var p_x = f32(global_id.x % rendering_info.real_canvas_width) / f32(rendering_info.real_canvas_width);
+  var p_y = f32(global_id.x / rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   var french_or_dutch = rendering_info.current_time % 2.0 < 1.0;
-  var is_blue = select(bmh >= 2 * rendering_info.canvas_height / 3, bmw < rendering_info.real_canvas_width / 3, french_or_dutch);
-  var is_white = select(bmh < 2 * rendering_info.canvas_height / 3 && bmh >= rendering_info.canvas_height / 3, bmw < 2 * rendering_info.real_canvas_width / 3 && bmw >= rendering_info.real_canvas_width / 3, french_or_dutch);
-  var is_red = select(bmh < rendering_info.canvas_height / 3, bmw >= 2 * rendering_info.real_canvas_width / 3, french_or_dutch);
-  var b = select(0.f, 1.f, is_blue || is_white);
-  var g = select(0.f, 1.f, is_white);
-  var r = select(0.f, 1.f, is_red || is_white);
+  var b = 0.2;
+  var g = lerp(p_y, 1.f - p_y, sin(rendering_info.current_time * pi) * 0.5 + 0.5);
+  var r = lerp(1.f - p_x, p_x, sin(rendering_info.current_time * pi) * 0.5 + 0.5);
   resultMatrix[bound] = pack4x8unorm(vec4<f32>(b, g, r, 1.f));
 }"""
         }
