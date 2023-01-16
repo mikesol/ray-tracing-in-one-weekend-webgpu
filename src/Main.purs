@@ -113,10 +113,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
       }
     let
-      frenchFlagDesc = x
+      skyDesc = x
         { code:
             """
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
+  return a + (b - a) * t;
+}
+
+fn lerpv(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
   return a + (b - a) * t;
 }
 
@@ -126,7 +130,28 @@ struct rendering_info_struct {
   canvas_height: u32, // height of the canvas in pixels
   current_time: f32 // current time in seconds
 }
+
+struct ray {
+  origin: vec3<f32>,
+  direction: vec3<f32>
+}
+
+fn point_at_parameter(r: ptr<function,ray>, t: f32) -> vec3<f32> {
+  return (*r).origin + t * (*r).direction;
+}
+
+const white = vec3<f32>(1.0, 1.0, 1.0);
+const sky_blue = vec3<f32>(0.5, 0.7, 1.0);
+
+fn color(r: ptr<function,ray>) -> vec3<f32> {
+  var unit_direction = normalize((*r).direction);
+  var t = 0.5 * (unit_direction.y + 1.0);
+  return lerpv(white, sky_blue, t);
+}
+
+
 const pi = 3.141592653589793;
+const origin = vec3(0.0, 0.0, 0.0);
 
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read_write> resultMatrix : array<u32>;
@@ -135,23 +160,28 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width * rendering_info.canvas_height) {
     return;
   }
-  var bound = ((global_id.x / rendering_info.real_canvas_width) * rendering_info.overshot_canvas_width) + (global_id.x % rendering_info.real_canvas_width) ;
+  var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
+  // normalize so that the smaller dimension is 2 end-to-end
+  var ambitus_x = select(2.0 * aspect, 2.0, aspect >= 1.0);
+  var ambitus_y = select(2.0 * aspect, 2.0, aspect < 1.0);
+  var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
   var p_x = f32(global_id.x % rendering_info.real_canvas_width) / f32(rendering_info.real_canvas_width);
-  var p_y = f32(global_id.x / rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
-  var french_or_dutch = rendering_info.current_time % 2.0 < 1.0;
-  var b = 0.2;
-  var g = lerp(p_y, 1.f - p_y, sin(rendering_info.current_time * pi) * 0.5 + 0.5);
-  var r = lerp(1.f - p_x, p_x, sin(rendering_info.current_time * pi) * 0.5 + 0.5);
-  resultMatrix[bound] = pack4x8unorm(vec4<f32>(b, g, r, 1.f));
+  var p_y = 1. - f32(global_id.x / rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
+  var bound = ((global_id.x / rendering_info.real_canvas_width) * rendering_info.overshot_canvas_width) + (global_id.x % rendering_info.real_canvas_width) ;
+  var r: ray;
+  r.origin = origin;
+  r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
+  var my_color = color(&r);
+  resultMatrix[bound] = pack4x8unorm(vec4<f32>(my_color.b, my_color.g, my_color.r, 1.f));
 }"""
         }
-    frenchFlagModule <- liftEffect $ createShaderModule device frenchFlagDesc
+    skyModule <- liftEffect $ createShaderModule device skyDesc
     let
-      (frenchFlagStage :: GPUProgrammableStage) = x
-        { "module": frenchFlagModule
+      (skyStage :: GPUProgrammableStage) = x
+        { "module": skyModule
         , entryPoint: "main"
         }
-    frenchFlagBufferBindGroupLayout <- liftEffect $ createBindGroupLayout device
+    skyBufferBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
               [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
@@ -164,10 +194,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                   )
               ]
           }
-    frenchFlagBufferPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ frenchFlagBufferBindGroupLayout ] }
-    frenchFlagBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: frenchFlagBufferBindGroupLayout
+    skyBufferPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ skyBufferBindGroupLayout ] }
+    skyBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: skyBufferBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
@@ -175,9 +205,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
       }
-    frenchFlagComputePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: frenchFlagBufferPipelineLayout
-      , compute: frenchFlagStage
+    skyComputePipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: skyBufferPipelineLayout
+      , compute: skyStage
       }
     let
       (config :: GPUCanvasConfiguration) = x
@@ -206,13 +236,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         let asBuffer = buffer cinfo
         whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 3) [ fromNumber' tn ]
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
-        frenchFlagPassEncoder <- beginComputePass commandEncoder (x {})
-        GPUComputePassEncoder.setPipeline frenchFlagPassEncoder
-          frenchFlagComputePipeline
-        GPUComputePassEncoder.setBindGroup frenchFlagPassEncoder 0
-          frenchFlagBindGroup
-        GPUComputePassEncoder.dispatchWorkgroups frenchFlagPassEncoder $ ceil (toNumber (canvasWidth * canvasHeight) / 64.0)
-        GPUComputePassEncoder.end frenchFlagPassEncoder
+        skyPassEncoder <- beginComputePass commandEncoder (x {})
+        GPUComputePassEncoder.setPipeline skyPassEncoder
+          skyComputePipeline
+        GPUComputePassEncoder.setBindGroup skyPassEncoder 0
+          skyBindGroup
+        GPUComputePassEncoder.dispatchWorkgroups skyPassEncoder $ ceil (toNumber (canvasWidth * canvasHeight) / 64.0)
+        GPUComputePassEncoder.end skyPassEncoder
         copyBufferToTexture
           commandEncoder
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
