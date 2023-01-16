@@ -116,14 +116,16 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       skyDesc = x
         { code:
             """
+// util
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
   return a + (b - a) * t;
 }
 
-fn lerpv(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
-  return a + (b - a) * t;
+fn lerpv(a: ptr<function,vec3<f32>>, b: ptr<function,vec3<f32>>, t: f32) -> vec3<f32> {
+  return (*a) + ((*b) - (*a)) * t;
 }
 
+// input data
 struct rendering_info_struct {
   real_canvas_width: u32, // width of the canvas in pixels
   overshot_canvas_width: u32, // width of the canvas in pixels so that the byte count per pixel is a multiple of 256
@@ -131,6 +133,7 @@ struct rendering_info_struct {
   current_time: f32 // current time in seconds
 }
 
+// ray
 struct ray {
   origin: vec3<f32>,
   direction: vec3<f32>
@@ -140,19 +143,34 @@ fn point_at_parameter(r: ptr<function,ray>, t: f32) -> vec3<f32> {
   return (*r).origin + t * (*r).direction;
 }
 
-const white = vec3<f32>(1.0, 1.0, 1.0);
-const sky_blue = vec3<f32>(0.5, 0.7, 1.0);
-
-fn color(r: ptr<function,ray>) -> vec3<f32> {
-  var unit_direction = normalize((*r).direction);
-  var t = 0.5 * (unit_direction.y + 1.0);
-  return lerpv(white, sky_blue, t);
+// hit
+fn hit_sphere(center: ptr<function, vec3<f32>>, radius: f32, r: ptr<function,ray>) -> bool {
+  var oc = (*r).origin - *center;
+  var a = dot((*r).direction, (*r).direction);
+  var b = 2.0 * dot(oc, (*r).direction);
+  var c = dot(oc, oc) - radius * radius;
+  var discriminant = b * b - 4.0 * a * c;
+  return discriminant > 0.0;
 }
 
+// color
+fn color(r: ptr<function,ray>) -> vec3<f32> {
+  var center = vec3<f32>(0.0, 0.0, -1.0);
+  if (hit_sphere(&center, 0.5, r)) {
+    return vec3<f32>(1.0, 0.0, 0.0);
+  }
+  var unit_direction = normalize((*r).direction);
+  var t = 0.5 * (unit_direction.y + 1.0);
+  var white = vec3<f32>(1.0, 1.0, 1.0);
+  var sky_blue = vec3<f32>(0.5, 0.7, 1.0);
+  return lerpv(&white, &sky_blue, t);
+}
 
+// constants
 const pi = 3.141592653589793;
 const origin = vec3(0.0, 0.0, 0.0);
 
+// main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read_write> resultMatrix : array<u32>;
 @compute @workgroup_size(64)
@@ -162,8 +180,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   }
   var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   // normalize so that the smaller dimension is 2 end-to-end
-  var ambitus_x = select(2.0 * aspect, 2.0, aspect >= 1.0);
-  var ambitus_y = select(2.0 * aspect, 2.0, aspect < 1.0);
+  var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
+  var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
   var p_x = f32(global_id.x % rendering_info.real_canvas_width) / f32(rendering_info.real_canvas_width);
   var p_y = 1. - f32(global_id.x / rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
