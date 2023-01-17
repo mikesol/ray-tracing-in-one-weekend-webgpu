@@ -260,10 +260,6 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , 0.0
         , -1.0
         , 0.5
-        , 0.0
-        , -100.5
-        , -1.0
-        , 100.0
         ] -- <> randos
     let nSpheres = length rawSphereData / 4
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
@@ -373,7 +369,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 fn hit_color(r: ptr<function,ray>, rec: ptr<function,hit_record>) -> vec3<f32> {
   var normal = (*rec).normal;
   //return 0.5 * vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0);
-  return sin(cos(sin(cos(sin(cos(vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0)))))));
+  return sin(cos(sin(cos(vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0)))));
 }
 
 fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
@@ -595,7 +591,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = max 1 $ min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
+        let antiAliasPasses = 8 -- max 1 $ min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
         Ref.write (cf + 1) currentFrame
