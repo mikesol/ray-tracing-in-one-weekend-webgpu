@@ -6,7 +6,7 @@ import Control.Alt ((<|>))
 import Control.Lazy (fix)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (fold, length, replicate)
+import Data.Array (fold, length, replicate, (..))
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
 import Data.ArrayBuffer.Typed (class TypedArray, buffer, fromArray, set, setTyped, whole)
 import Data.ArrayBuffer.Types (ArrayView, Float32Array)
@@ -15,7 +15,7 @@ import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
-import Data.Traversable (sequence, sequence_)
+import Data.Traversable (for_, sequence, sequence_)
 import Data.UInt (fromInt)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (klass_)
@@ -142,24 +142,31 @@ hitSphere =
   """
 // hit sphere
 fn hit_sphere(cx: f32, cy: f32, cz: f32, radius: f32, r: ptr<function,ray>, t_min: f32, t_max: f32, hit_t: ptr<function,f32>) -> bool {
-  var center = vec3(cx, cy, cz);
-  var oc = (*r).origin - center;
-  var a = dot((*r).direction, (*r).direction);
-  var b = dot(oc, (*r).direction);
-  var c = dot(oc, oc) - radius * radius;
-  var discriminant = b * b - a * c;
-  if (discriminant > 0) {
-    var temp = (-b - sqrt(discriminant)) / a;
-    if (temp < t_max && temp > t_min) {
-      *hit_t = temp;
-      return true;
+  var i: i32 = 0;
+  loop {
+    if i >= 32 { break; }
+
+    var center = vec3(cx, cy, cz);
+    var oc = (*r).origin - center;
+    var a = dot((*r).direction, (*r).direction);
+    var b = dot(oc, (*r).direction);
+    var c = dot(oc, oc) - radius * radius;
+    var discriminant = b * b - a * c;
+    if (discriminant > 0) {
+      var temp = (-b - sqrt(discriminant)) / a;
+      if (temp < t_max && temp > t_min) {
+        *hit_t = temp;
+        return true;
+      }
+      temp = (-b + sqrt(discriminant)) / a;
+      if (temp < t_max && temp > t_min) {
+        *hit_t = temp;
+        return true;
+      }
     }
-    temp = (-b + sqrt(discriminant)) / a;
-    if (temp < t_max && temp > t_min) {
-      *hit_t = temp;
-      return true;
-    }
+    i++;
   }
+
   return false;
 }
 """
@@ -253,14 +260,18 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: 24 -- align(4) size(24)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
-    randos <- liftEffect $ sequence $ join $ replicate 5 [ random <#> \x -> x * 5.0 - 2.5, pure 0.5, random <#> \x -> x * -2.0 - 1.0, pure 0.25 ]
+    randos <- liftEffect $ sequence $ join $ replicate 1 [ random <#> \x -> x * 10.0 - 2.5, pure 0.25, random <#> \x -> x * -10.0 - 1.0, pure 0.125 ]
     let
       rawSphereData = map fromNumber' $
         [ 0.0
         , 0.0
         , -1.0
         , 0.5
-        ] -- <> randos
+        , 0.0
+        , -100.5
+        , -1.0
+        , 100.0
+        ] <> randos
     let nSpheres = length rawSphereData / 4
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
     sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
@@ -591,7 +602,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = 8 -- max 1 $ min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
+        let antiAliasPasses = max 1 $ min 8 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
         Ref.write (cf + 1) currentFrame
@@ -623,13 +634,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
         let
-          work = do
+          work n = do
             -- spheres
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               wHitsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               hitComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY (nSpheres * antiAliasPasses)
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) (nSpheres * antiAliasPasses)
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
@@ -637,7 +648,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               wColorsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
             -- antiAlias
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rColorsBindGroup
@@ -645,8 +656,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               wCanvasBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               antiAliasComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
-        sequence_ (replicate 10 work)
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) 1
+        for_ (1 .. 32) work
 
         --
         GPUComputePassEncoder.end computePassEncoder
