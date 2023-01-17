@@ -44,7 +44,7 @@ import Web.GPU.GPUCanvasConfiguration (GPUCanvasConfiguration)
 import Web.GPU.GPUCanvasContext (configure, getCurrentTexture)
 import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToTexture, finish)
 import Web.GPU.GPUComputePassEncoder as GPUComputePassEncoder
-import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule)
+import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule, limits)
 import Web.GPU.GPUDevice as GPUDevice
 import Web.GPU.GPUExtent3D (gpuExtent3DWH)
 import Web.GPU.GPUProgrammableStage (GPUProgrammableStage)
@@ -71,8 +71,20 @@ struct rendering_info_struct {
   overshot_canvas_width: u32, // width of the canvas in pixels so that the byte count per pixel is a multiple of 256
   canvas_height: u32, // height of the canvas in pixels
   n_spheres: u32, // number of spheres
+  anti_alias_passes: u32, // number of spheres
   current_time: f32 // current time in seconds
 } 
+"""
+
+antiAliasFuzzing :: String
+antiAliasFuzzing = """
+const fuzz_fac = 0.5;
+const half_fuzz_fac = fuzz_fac / 2.0;
+fn fuzz2(i: u32, n: u32, d: u32) -> f32
+{
+    var fi = f32(i);
+    return fi + (fuzz_fac * pow(f32(n) / f32(d), 0.5) - half_fuzz_fac);
+}
 """
 
 lerp :: String
@@ -165,20 +177,8 @@ fn make_hit_rec(cx: f32, cy: f32, cz: f32, radius: f32, t: f32, r: ptr<function,
 usefulConsts :: String
 usefulConsts =
   """
-const f_max = 3.40282346638528859812e+38f;
-const reasonable_upper_bound = 10.0f;
+const color_mult = 1 << 16;
 const origin = vec3(0.0, 0.0, 0.0);
-      """
-
-boundNormalization :: String
-boundNormalization =
-  """
-fn normalize_t_to_bounds(x: f32) -> f32 {
-  return (1.f - max(0.f, min(1.f, (x / reasonable_upper_bound))));
-}
-fn unnormalize_bounds_to_t(x: f32) -> f32 {
-  return (1.f - x) * reasonable_upper_bound;
-}
       """
 
 averager :: forall a. EuclideanRing a => Effect (a -> Effect a)
@@ -222,9 +222,6 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
   context <- getContext canvas >>= maybe
     (showErrorMessage *> throwError (error "could not find context"))
     pure
-  let maxCanvasWidth = 4096
-  let maxBufferWidth = ceil (toNumber maxCanvasWidth * 4.0 / 256.0) * 256
-  let maxCanvasHeight = 2000
   timeDeltaAverager <- averager
   frameDeltaAverager <- averager
   startsAt <- getTime <$> now
@@ -247,11 +244,10 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           showErrorMessage
           throwError $ error "WebGPU is not supported"
         Just device -> pure device
-    let hitsBufferSize = maxCanvasWidth * maxCanvasHeight * 4 -- 4 because we're storing u32s
-    let canvasBufferSize = maxBufferWidth * maxCanvasHeight * 1 -- 1 because bgra8unorm is 1 byte per pixel
     queue <- liftEffect $ GPUDevice.queue device
+    deviceLimits <- liftEffect $ limits device
     canvasInfoBuffer <- liftEffect $ createBuffer device $ x
-      { size: 20 -- align(4) size(20)
+      { size: 24 -- align(4) size(24)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
     let
@@ -268,39 +264,39 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     let nSpheres = length rawSphereData / 4
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
     sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
+    rawColorBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage
+      }
     hitsBuffer <- liftEffect $ createBuffer device $ x
-      { size: hitsBufferSize
-      -- , usage: GPUBufferUsage.storage
-      , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage
       }
     wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
-      { size: canvasBufferSize
+      { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
       }
     let
-      clearSpheresDesc = x
+      clearBufferDesc = x
         { code:
             fold
               [ inputData
               , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(0) @binding(1) var<storage, read_write> result_matrix : array<u32>;
-@group(1) @binding(0) var<storage, read> sphere_info : array<f32>;
-@compute @workgroup_size(64)
+@group(1) @binding(0) var<storage, read_write> result_matrix : array<u32>;
+@compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  if (global_id.x >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.n_spheres) {
-    return;
-  }
-  
-  result_matrix[global_id.x] = 0u;
+  // assume that x is always w, y is always h
+  // but z is variable
+  result_matrix[global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x] = 0u;
 }"""
               ]
         }
-    clearSpheresModule <- liftEffect $ createShaderModule device clearSpheresDesc
+    clearBufferModule <- liftEffect $ createShaderModule device clearBufferDesc
     let
-      (clearSpheresStage :: GPUProgrammableStage) = x
-        { "module": clearSpheresModule
+      (clearBufferStage :: GPUProgrammableStage) = x
+        { "module": clearBufferModule
         , entryPoint: "main"
         }
     let
@@ -311,18 +307,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , lerpv
               , inputData
               , ray
+              , antiAliasFuzzing
               , pointAtParameter
               , hitSphere
               , usefulConsts
-              , boundNormalization
               , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(0) @binding(1) var<storage, read_write> result_matrix : array<atomic<u32>>;
-@group(1) @binding(0) var<storage, read> sphere_info : array<f32>;
-@compute @workgroup_size(64)
+@group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
+@group(1) @binding(0) var<storage, read_write> result_matrix : array<atomic<u32>>;
+@compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  if (global_id.x >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.n_spheres) {
+  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z > rendering_info.n_spheres * rendering_info.anti_alias_passes) {
     return;
   }
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
@@ -330,9 +326,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
-  var p_x = f32(global_id.x % rendering_info.real_canvas_width) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - f32((global_id.x / rendering_info.real_canvas_width) % rendering_info.canvas_height) / f32(rendering_info.canvas_height);
-  var sphere = global_id.x / cwch;
+  var alias_pass = global_id.z / rendering_info.n_spheres; 
+  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.n_spheres) / f32(rendering_info.real_canvas_width);
+  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.n_spheres) / f32(rendering_info.canvas_height);
+  var sphere = global_id.z % rendering_info.n_spheres;
   var r: ray;
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
@@ -342,7 +339,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (i_was_hit) {
     var norm_t = 1.f / hit_t;
     var sphere_idx = f32(sphere);
-    _ = atomicMax(&result_matrix[global_id.x % cwch], pack2x16float(vec2<f32>(sphere_idx, norm_t)));
+    var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * (global_id.z / rendering_info.n_spheres));
+    _ = atomicMax(&result_matrix[idx], pack2x16float(vec2<f32>(sphere_idx, norm_t)));
   }
 }"""
               ]
@@ -354,18 +352,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , entryPoint: "main"
         }
     let
-      masterpieceDesc = x
+      colorFillDesc = x
         { code:
             fold
               [ lerp
               , lerpv
               , inputData
               , ray
+              , antiAliasFuzzing
               , pointAtParameter
               , hitRecord
               , makeHitRec
               , usefulConsts
-              , boundNormalization
               , """
 // color
 fn hit_color(r: ptr<function,ray>, rec: ptr<function,hit_record>) -> vec3<f32> {
@@ -383,12 +381,12 @@ fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
 
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(0) @binding(1) var<storage, read_write> result_matrix : array<u32>;
-@group(1) @binding(0) var<storage, read> sphere_info : array<f32>;
-@group(2) @binding(0) var<storage, read> hit_info : array<u32>;
-@compute @workgroup_size(64)
+@group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
+@group(1) @binding(0) var<storage, read> hit_info : array<u32>;
+@group(2) @binding(0) var<storage, read_write> result_matrix : array<atomic<u32>>;
+@compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  if (global_id.x >= rendering_info.real_canvas_width * rendering_info.canvas_height) {
+  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >= rendering_info.anti_alias_passes) {
     return;
   }
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
@@ -396,18 +394,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
-  var p_x = f32(global_id.x % rendering_info.real_canvas_width) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - f32((global_id.x / rendering_info.real_canvas_width) % rendering_info.canvas_height) / f32(rendering_info.canvas_height);
-  var sphere = global_id.x / (rendering_info.real_canvas_width * rendering_info.canvas_height);
+  var alias_pass = global_id.z;
+  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.n_spheres) / f32(rendering_info.real_canvas_width);
+  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.n_spheres) / f32(rendering_info.canvas_height);
   var r: ray;
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
-  var hit_bound = global_id.x;
-  var bound = ((global_id.x / rendering_info.real_canvas_width) * rendering_info.overshot_canvas_width) + (global_id.x % rendering_info.real_canvas_width) ;
-  var was_i_hit = hit_info[hit_bound];
+  var hit_idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
+  var was_i_hit = hit_info[hit_idx];
+  var my_color = vec3(0.0,0.0,0.0);
+  // my_color = sky_color(&r);
   if (was_i_hit == 0u) {
-    var my_color = sky_color(&r);
-    result_matrix[bound] = pack4x8unorm(vec4<f32>(my_color.b, my_color.g, my_color.r, 1.f));
+    my_color = sky_color(&r);
   } else {
     var unpacked = unpack2x16float(was_i_hit);
     var sphere_idx = u32(unpacked[0]);
@@ -415,20 +413,65 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     var norm_t = 1.f / unpacked[1];
     var rec: hit_record;
     _ = make_hit_rec(sphere_info[sphere_offset], sphere_info[sphere_offset + 1], sphere_info[sphere_offset + 2], sphere_info[sphere_offset + 3], norm_t, &r, &rec);
-    var my_color = hit_color(&r, &rec);
-    result_matrix[bound] = pack4x8unorm(vec4<f32>(my_color.b, my_color.g, my_color.r, 1.f));
-   }
+    my_color = hit_color(&r, &rec);
+  }
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) * 3;
+  _ = atomicAdd(&result_matrix[idx], u32(my_color.b * color_mult));
+  _ = atomicAdd(&result_matrix[idx + 1],  u32(my_color.g * color_mult));
+  _ = atomicAdd(&result_matrix[idx + 2], u32(my_color.r * color_mult));
 }
 """
               ]
         }
-    masterpieceModule <- liftEffect $ createShaderModule device masterpieceDesc
+    colorFillModule <- liftEffect $ createShaderModule device colorFillDesc
     let
-      (masterpieceStage :: GPUProgrammableStage) = x
-        { "module": masterpieceModule
+      (colorFillStage :: GPUProgrammableStage) = x
+        { "module": colorFillModule
         , entryPoint: "main"
         }
-    rwBindGroupLayout <- liftEffect $ createBindGroupLayout device
+    let
+      antiAliasDesc = x
+        { code:
+            fold
+              [ lerp
+              , lerpv
+              , inputData
+              , ray
+              , antiAliasFuzzing
+              , pointAtParameter
+              , hitRecord
+              , makeHitRec
+              , usefulConsts
+              , """
+// average the anti-aliasing
+fn cc(c: u32, aap: u32) -> f32 {
+  return max(0.0, min(1.0, f32(c) / f32(color_mult * aap)));
+}
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
+@group(1) @binding(0) var<storage, read> color_info : array<u32>;
+@group(2) @binding(0) var<storage, read_write> result_matrix : array<u32>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height) {
+    return;
+  }
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) * 3;
+  var overshot_idx = global_id.x + (global_id.y * rendering_info.overshot_canvas_width);
+  result_matrix[overshot_idx] = pack4x8unorm(vec4(cc(color_info[idx], rendering_info.anti_alias_passes), cc(color_info[idx + 1], rendering_info.anti_alias_passes), cc(color_info[idx + 2], rendering_info.anti_alias_passes), 1.f));
+  //result_matrix[overshot_idx] = pack4x8unorm(vec4(1.f,0.f,0.f,1.f));
+}
+"""
+              ]
+        }
+    antiAliasModule <- liftEffect $ createShaderModule device antiAliasDesc
+    let
+      (antiAliasStage :: GPUProgrammableStage) = x
+        { "module": antiAliasModule
+        , entryPoint: "main"
+        }
+    readerBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
               [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
@@ -436,7 +479,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.storage }
+                  ( x { type: GPUBufferBindingType.readOnlyStorage }
                       :: GPUBufferBindingLayout
                   )
               ]
@@ -450,53 +493,81 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                   )
               ]
           }
-    rwWithSpheresPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ rwBindGroupLayout, rBindGroupLayout ] }
-    rwWithSpheresAndHitsPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ rwBindGroupLayout, rBindGroupLayout, rBindGroupLayout ] }
-    masterpieceBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rwBindGroupLayout
+    wBindGroupLayout <- liftEffect $ createBindGroupLayout device
+      $ x
+          { entries:
+              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                  ( x { type: GPUBufferBindingType.storage }
+                      :: GPUBufferBindingLayout
+                  )
+              ]
+          }
+    -- for when we are reading from a context and writing to a buffer
+    readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
+    -- for when we are reading from a context, taking an input, and transforming it
+    -- to an output
+    readIOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, rBindGroupLayout, wBindGroupLayout ] }
+    readerBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: readerBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
           , gpuBindGroupEntry 1
-              (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
-          ]
-      }
-    hitsBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rwBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: hitsBuffer } :: GPUBufferBinding)
-          ]
-      }
-    spheresBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
               (x { buffer: sphereBuffer } :: GPUBufferBinding)
           ]
       }
-    justHitsBindGroup <- liftEffect $ createBindGroup device $ x
+    wHitsBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: hitsBuffer } :: GPUBufferBinding)
+          ]
+      }
+    rHitsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: rBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: hitsBuffer } :: GPUBufferBinding)
           ]
       }
-    clearSpheresPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: rwWithSpheresPipelineLayout
-      , compute: clearSpheresStage
+    wColorsBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+          ]
+      }
+    rColorsBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: rBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+          ]
+      }
+    wCanvasBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
+          ]
+      }
+    clearBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: clearBufferStage
       }
     hitComputePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: rwWithSpheresPipelineLayout
+      { layout: readOPipelineLayout
       , compute: hitStage
       }
-    masterpieceComputePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: rwWithSpheresAndHitsPipelineLayout
-      , compute: masterpieceStage
+    colorFillComputePipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readIOPipelineLayout
+      , compute: colorFillStage
+      }
+    antiAliasComputePipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readIOPipelineLayout
+      , compute: antiAliasStage
       }
 
     let
@@ -508,6 +579,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , alphaMode: opaque
         }
     liftEffect $ configure context config
+    let maxStorageBufferBindingSize = deviceLimits.maxStorageBufferBindingSize
     let
       encodeCommands colorTexture = do
         cw <- clientWidth (toElement canvas)
@@ -518,35 +590,61 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
+        let antiAliasPasses = min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
+        -- logShow antiAliasPasses
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
         Ref.write (cf + 1) currentFrame
         commandEncoder <- createCommandEncoder device (x {})
-        cinfo <- fromArray $ map fromInt [ canvasWidth, overshotWidth, canvasHeight, nSpheres, 0 ]
+        let workgroupX = ceil (toNumber canvasWidth / 16.0)
+        let workgroupY = ceil (toNumber canvasHeight / 16.0)
+        cinfo <- fromArray $ map fromInt
+          [ canvasWidth
+          , overshotWidth
+          , canvasHeight
+          , nSpheres
+          , antiAliasPasses
+          , 0
+          ]
         let asBuffer = buffer cinfo
-        whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 4) [ fromNumber' tn ]
+        whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 5) [ fromNumber' tn ]
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
         -- not necessary in the loop, but useful as a stress test for animating positions
         computePassEncoder <- beginComputePass commandEncoder (x {})
-        -- clear spheres
-        GPUComputePassEncoder.setPipeline computePassEncoder clearSpheresPipeline
+        -- clear spheres as they're subject to an atomic operation
+        GPUComputePassEncoder.setPipeline computePassEncoder clearBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
-          hitsBindGroup
+          readerBindGroup
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          spheresBindGroup
-        GPUComputePassEncoder.dispatchWorkgroups computePassEncoder $ ceil (toNumber (canvasWidth * canvasHeight * nSpheres) / 64.0)
+          wHitsBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        -- clear colors as they're subject to an atomic operation
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wColorsBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
         -- spheres
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wHitsBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
           hitComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroups computePassEncoder $ ceil (toNumber (canvasWidth * canvasHeight * nSpheres) / 64.0)
-        -- masterpiece
-        GPUComputePassEncoder.setBindGroup computePassEncoder 0
-          masterpieceBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY (nSpheres * antiAliasPasses)
+        -- colorFill
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          rHitsBindGroup
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          justHitsBindGroup
+          wColorsBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
-          masterpieceComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroups computePassEncoder $ ceil (toNumber (canvasWidth * canvasHeight) / 64.0)
+          colorFillComputePipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+        -- antiAlias
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          rColorsBindGroup
+        GPUComputePassEncoder.setBindGroup computePassEncoder 2
+          wCanvasBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder
+          antiAliasComputePipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+
         --
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
