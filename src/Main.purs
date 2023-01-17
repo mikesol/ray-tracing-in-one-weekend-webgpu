@@ -6,7 +6,7 @@ import Control.Alt ((<|>))
 import Control.Lazy (fix)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (fold, length)
+import Data.Array (fold, length, replicate)
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
 import Data.ArrayBuffer.Typed (class TypedArray, buffer, fromArray, set, setTyped, whole)
 import Data.ArrayBuffer.Types (ArrayView, Float32Array)
@@ -15,6 +15,7 @@ import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
+import Data.Traversable (sequence, sequence_)
 import Data.UInt (fromInt)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (klass_)
@@ -24,6 +25,7 @@ import Deku.Toplevel (runInBody)
 import Effect (Effect)
 import Effect.Aff (Milliseconds(..), delay, error, launchAff_, throwError)
 import Effect.Class (liftEffect)
+import Effect.Random (random)
 import Effect.Ref as Ref
 import FRP.Event (create)
 import QualifiedDo.Alt as Alt
@@ -77,7 +79,8 @@ struct rendering_info_struct {
 """
 
 antiAliasFuzzing :: String
-antiAliasFuzzing = """
+antiAliasFuzzing =
+  """
 const fuzz_fac = 0.5;
 const half_fuzz_fac = fuzz_fac / 2.0;
 fn fuzz2(i: u32, n: u32, d: u32) -> f32
@@ -250,8 +253,9 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: 24 -- align(4) size(24)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
+    randos <- liftEffect $ sequence $ join $ replicate 5 [ random <#> \x -> x * 5.0 - 2.5, pure 0.5, random <#> \x -> x * -2.0 - 1.0, pure 0.25 ]
     let
-      rawSphereData = map fromNumber'
+      rawSphereData = map fromNumber' $
         [ 0.0
         , 0.0
         , -1.0
@@ -260,7 +264,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , -100.5
         , -1.0
         , 100.0
-        ]
+        ] -- <> randos
     let nSpheres = length rawSphereData / 4
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
     sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
@@ -368,7 +372,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 // color
 fn hit_color(r: ptr<function,ray>, rec: ptr<function,hit_record>) -> vec3<f32> {
   var normal = (*rec).normal;
-  return 0.5 * vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0);
+  //return 0.5 * vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0);
+  return sin(cos(sin(cos(sin(cos(vec3<f32>(normal.x + 1.0, normal.y + 1.0, normal.z + 1.0)))))));
 }
 
 fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
@@ -590,8 +595,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
-        -- logShow antiAliasPasses
+        let antiAliasPasses = max 1 $ min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
         Ref.write (cf + 1) currentFrame
@@ -622,28 +626,31 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
-        -- spheres
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wHitsBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          hitComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY (nSpheres * antiAliasPasses)
-        -- colorFill
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          rHitsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          wColorsBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          colorFillComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
-        -- antiAlias
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          rColorsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          wCanvasBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          antiAliasComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        let
+          work = do
+            -- spheres
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              wHitsBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              hitComputePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY (nSpheres * antiAliasPasses)
+            -- colorFill
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              rHitsBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wColorsBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              colorFillComputePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+            -- antiAlias
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              rColorsBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wCanvasBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              antiAliasComputePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        sequence_ (replicate 10 work)
 
         --
         GPUComputePassEncoder.end computePassEncoder
@@ -683,7 +690,7 @@ main = do
           []
       , D.div
           Alt.do
-            klass_ "absolute p-3 text-white"
+            klass_ "absolute p-3 text-slate"
           [ errorMessage.event $> false <|> pure true <#~>
               if _ then
                 text (_.avgTime >>> show >>> ("Avg time: " <> _) <$> frameInfo.event)
