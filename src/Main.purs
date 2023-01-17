@@ -15,7 +15,7 @@ import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
-import Data.Traversable (for_, sequence, sequence_)
+import Data.Traversable (for_, sequence)
 import Data.UInt (fromInt)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (klass_)
@@ -657,7 +657,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             GPUComputePassEncoder.setPipeline computePassEncoder
               antiAliasComputePipeline
             GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) 1
-        for_ (1 .. 32) work
+        for_ (1 .. 64) work
 
         --
         GPUComputePassEncoder.end computePassEncoder
