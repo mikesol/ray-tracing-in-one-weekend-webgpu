@@ -101,12 +101,24 @@ readWriteAtLevel :: String
 readWriteAtLevel =
   """
 fn read_at_level(bitmask: u32, level: u32, lr: bool) -> bool {
-  var spot = level * 2 + select(1, 0, lr);
-  return (bitmask & (1 << spot)) != 0;
+  var spot = level * 2u + select(1u, 0u, lr);
+  return (bitmask & (1u << spot)) != 0;
+}
+fn read_at_left(bitmask: u32, level: u32) -> bool {
+  return read_at_level(bitmask, level, true);
+}
+fn read_at_right(bitmask: u32, level: u32) -> bool {
+  return read_at_level(bitmask, level, false);
 }
 fn write_at_level(bitmask: u32, level: u32, lr: bool, val: bool) -> u32 {
-  var spot = level * 2 + select(1, 0, lr);
-  return select(bitmask & ~ (1 << spot), bitmask | (1 << spot), val);
+  var spot = level * 2u + select(1u, 0u, lr);
+  return select(bitmask & ~ (1u << spot), bitmask | (1u << spot), val);
+}
+fn write_at_left(bitmask: u32, level: u32, val: bool) -> u32 {
+  return write_at_level(bitmask, level, true, val);
+}
+fn write_at_right(bitmask: u32, level: u32, val: bool) -> u32 {
+  return write_at_level(bitmask, level, false, val);
 }
 fn read_stack_at_bitmask(bitmask: u32) -> u32 {
   return bitmask >> 24;
@@ -114,17 +126,23 @@ fn read_stack_at_bitmask(bitmask: u32) -> u32 {
 fn write_stack_at_bitmask(bitmask: u32, stack: u32) -> u32 {
   return (bitmask & 0xFFFFFF) | (stack << 24);
 }
-fn read_x_at_bitmask(xy: u32) -> u32 {
-  return xy & 0xFFFF;
+fn read_x_at_bitmask(xyz: u32) -> u32 {
+  return xyz & 0x3fff; // range [0,14)
 }
-fn read_y_at_bitmask(xy: u32) -> u32 {
-  return xy >> 16;
+fn read_y_at_bitmask(xyz: u32) -> u32 {
+  return (xyz >> 14u) & 0x3fff; // range [14,28)
 }
-fn write_x_at_bitmask(xy: u32, x: u32) -> u32 {
-  return (xy & 0xFFFF0000) | x;
+fn read_z_at_bitmask(xyz: u32) -> u32 {
+  return xyz >> 28u; // range [28,32)
 }
-fn write_y_at_bitmask(xy: u32, y: u32) -> u32 {
-  return (xy & 0xFFFF) | (y << 16);
+fn write_x_at_bitmask(xyz: u32, x: u32) -> u32 {
+  return (xyz & 0xFFFFC000) | x;
+}
+fn write_y_at_bitmask(xyz: u32, y: u32) -> u32 {
+  return (xyz & 0xFFFC3FFF) | (y << 14u);
+}
+fn write_z_at_bitmask(xyz: u32, z: u32) -> u32 {
+  return (xyz & 0x3FFFFFFF) | (z << 28u);
 }
   """
 
@@ -145,9 +163,10 @@ fn u32_to_t_and_ix(i: u32, p: ptr<function, t_and_ix>) -> bool {
 
 fn t_and_ix_to_u32(p: ptr<function, t_and_ix>) -> u32 {
   // offset by 0.1 to prevent rounding errors when stored
-  return pack2x16float(vec2(f32(p.ix)+0.1, p.t));
+  return pack2x16float(vec2(f32((*p).ix)+0.1, (*p).t));
 }
   """
+
 aabb :: String
 aabb =
   """
@@ -208,26 +227,32 @@ fn bvh_node_bounding_box(node:bvh_node, box: ptr<function,aabb>) -> bool
 
 """
 
-
-hitMain ::  String
-hitMain """
+hitMain :: String
+hitMain =
+  """
+const workgroup_y_size = 16u;
+const dispatch_y_size = 4u;
+const y_stride = workgroup_y_size * dispatch_y_size;
   // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_info : array<bvh_node>;
-@group(1) @binding(0) var<storage, read> bvh__namespaced__hit_sphere_min: array<u32>;
-@group(1) @binding(1) var<storage, read> bvh__namespaced__node_ix: array<u32>;
-@group(1) @binding(2) var<storage, read> bvh__namespaced__node_xycoord: array<u32>;
-@group(1) @binding(3) var<storage, read> bvh__namespaced__branch_bitmask: array<u32>;
-@group(1) @binding(4) var<storage, read> bvh__namespaced__workgroups: array<u32>;
+@group(1) @binding(0) var<storage, read_write> bvh__namespaced__hit_sphere_min: array<u32>;
+@group(1) @binding(1) var<storage, read_write> bvh__namespaced__node_ix: array<u32>;
+@group(1) @binding(2) var<storage, read_write> bvh__namespaced__node_xycoord: array<u32>;
+@group(1) @binding(3) var<storage, read_write> bvh__namespaced__branch_bitmask: array<u32>;
+@group(2) @binding(0) var<storage, read_write> bvh__namespaced__workgroups: array<atomic<u32>>;
 @compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {return;
   // for now, we don't use a guard as we have no way of knowing how many workgroups we have
   // make sure to copy this to a dedicated workgroup buffer before running again!
   // get the current node we are exploring
-  var my_ix = 64u * global_id.x + global_id.y;
+  var my_ix = (y_stride * rendering_info.anti_alias_passes) * global_id.x + (global_id.y * rendering_info.anti_alias_passes) + rendering_info.anti_alias_passes;
   var x_coord = read_x_at_bitmask(bvh__namespaced__node_xycoord[my_ix]);
   var y_coord = read_y_at_bitmask(bvh__namespaced__node_xycoord[my_ix]);
+  var z_coord = read_z_at_bitmask(bvh__namespaced__node_xycoord[my_ix]);
+  var t = 0.0;
+  let bvh__namespaced_t = &t;
   var current_bvh_node_ix = bvh__namespaced__node_ix[my_ix];
   // create a struct to hold the min_t and sphere index
   var current_min_t_and_sphere: t_and_ix;
@@ -240,26 +265,23 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // and this is particularly important for diffuse materials where the anti-alias passes
   // will bounce all over the place
   // so we need for the atomics below to account for this
-  u32_to_t_and_ix(bvh__namespaced__hit_sphere_min[my_ix], &current_min_t_and_sphere);
-  ////////
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
+  u32_to_t_and_ix(bvh__namespaced__hit_sphere_min[(y_coord * rendering_info.real_canvas_width + x_coord) + (cwch * z_coord)], &current_min_t_and_sphere);
+  ////////
   var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
-  var alias_pass = global_id.z;
-  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
+  var alias_pass = z_coord;
+  var p_x = fuzz2(x_coord, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
+  var p_y = 1. - fuzz2(y_coord, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
   // get the bitmask that stores LR traversal and current stack information
   var current_bvh_lr_bitmask = bvh__namespaced__branch_bitmask[my_ix];
   // create a struct to hold the min_t and sphere index
-  var current_min_t_and_sphere: t_and_ix;
-  // populate the struct with the current min_t and sphere index
-  u32_to_t_and_ix(bvh__namespaced__hit_sphere_min[my_ix], &current_min_t_and_sphere);
   // get a temporary box where we store the bounding box of the current node
   var bvh__namespaced__tmp_box: aabb;
   // get the bounding box of the curernt object
-  bvh_node_bounding_box((*bvh__namespaced__nodes)[current_bvh_node_ix], &bvh__namespaced__tmp_box);
+  bvh_node_bounding_box(bvh_info[current_bvh_node_ix], &bvh__namespaced__tmp_box);
   // get a ray pointing from this coordinate
   var bvh__namespaced__r: ray;
   bvh__namespaced__r.origin = origin;
@@ -274,14 +296,16 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   /// tl;dr a gpu is not a cpu
   ////////////////////////////
   // get the index of the current sphere (there may not even be a sphere, but see the above note for why we do this)
-  var sphere_ix = ((*bvh__namespaced__nodes)[current_bvh_node_ix]).left * 4u;
+  var sphere_ix = (bvh_info[current_bvh_node_ix]).left * 4u;
   // calculate if we hit the sphere at this index
+  var bvh__namespaced__t_min = 0.0001f;
+  var bvh__namespaced__t_max = 10000.f;
   var sphere_hit = hit_sphere(
-    (*bvh__namespaced__spheres)[sphere_ix],
-    (*bvh__namespaced__spheres)[sphere_ix+1],
-    (*bvh__namespaced__spheres)[sphere_ix+2],
-    (*bvh__namespaced__spheres)[sphere_ix+3],
-    bvh__namespaced__r,
+    sphere_info[sphere_ix],
+    sphere_info[sphere_ix+1],
+    sphere_info[sphere_ix+2],
+    sphere_info[sphere_ix+3],
+    &bvh__namespaced__r,
     bvh__namespaced__t_min,
     bvh__namespaced__t_max,
     bvh__namespaced_t);
@@ -289,17 +313,17 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // a bvh algorithm proceeds in levels, so this shows how deep we are in the tree
   var current_bvh_stack = read_stack_at_bitmask(current_bvh_lr_bitmask);
   // are we focusing on the right of the tree
-  var right_at_current_stack = read_at_level(current_bvh_lr_bitmask, current_bvh_stack, true);
+  var right_at_current_stack = read_at_right(current_bvh_lr_bitmask, current_bvh_stack);
   // are we focusing on the left of the tree
-  var left_at_current_stack = read_at_level(current_bvh_lr_bitmask, current_bvh_stack, false);
+  var left_at_current_stack = read_at_left(current_bvh_lr_bitmask, current_bvh_stack);
   // are we focusing on the right of the tree at the previous level
-  var right_at_prev_stack = read_at_level(current_bvh_lr_bitmask, current_bvh_stack - 1, true);
+  var right_at_prev_stack = read_at_right(current_bvh_lr_bitmask, current_bvh_stack - 1);
   // are we focusing on the left of the tree at the previous level
   var left_at_prev_stack = !right_at_prev_stack;
   // hit detection for the bounding box
-  var was_aabb_hit = aabb_hit(&bvh__namespaced__tmp_box, bvh__namespaced__r, bvh__namespaced__t_min, bvh__namespaced__t_max);
+  var was_aabb_hit = aabb_hit(&bvh__namespaced__tmp_box, &bvh__namespaced__r, bvh__namespaced__t_min, bvh__namespaced__t_max);
   // is this object a sphere
-  var obj_is_sphere = ((*bvh__namespaced__nodes)[current_bvh_node_ix]).is_sphere == 1u;
+  var obj_is_sphere = (bvh_info[current_bvh_node_ix]).is_sphere == 1u;
   // have we started on this level yet
   var have_not_started_yet = !left_at_current_stack;
   // is the loop done at this level
@@ -315,7 +339,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         (stack_is_0 && !was_aabb_hit) ||
         (stack_is_0 && loop_completed))
      ) {
-    var i_plus_1 = ((*bvh__namespaced__nodes)[current_bvh_node_ix]).left + 1u;
+    var i_plus_1 = (bvh_info[current_bvh_node_ix]).left + 1u;
     ///////////////
     ///////////////
     ///////////////
@@ -337,20 +361,20 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         select(
           select(
             // we're on the right branch, so focus on right
-            ((*bvh__namespaced__nodes)[current_bvh_node_ix]).right,
+            (bvh_info[current_bvh_node_ix]).right,
             // when completed focus on parent
-            ((*bvh__namespaced__nodes)[current_bvh_node_ix]).parent,
+            (bvh_info[current_bvh_node_ix]).parent,
             loop_completed
           ),
           // if the box was hit, focus on the left node
           // otherwise focus on the parent
           select(
-            ((*bvh__namespaced__nodes)[current_bvh_node_ix]).parent,
-            ((*bvh__namespaced__nodes)[current_bvh_node_ix]).left,
+            (bvh_info[current_bvh_node_ix]).parent,
+            (bvh_info[current_bvh_node_ix]).left,
             was_aabb_hit),
           have_not_started_yet
         ),
-        ((*bvh__namespaced__nodes)[current_bvh_node_ix]).parent,
+        (bvh_info[current_bvh_node_ix]).parent,
         obj_is_sphere
       );
     var new_bvh_stack =
@@ -376,27 +400,27 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     // get a fresh index
     var fresh_ix = atomicAdd(&bvh__namespaced__workgroups[3], 1u);
     // what x do we need to encapsulate this
-    // from the idea that 4u * 16u for y size is a 64 unit stride
+    // from the idea that 4u * 16u for y size is a 64 unit stride multiplied by the number of anti-alias passes
     // which with 2**16 as the max in the x dimension is more than enough
     // for any canvas
-    var needed_x = ceil(f32(fresh_ix / f32(4u));
+    var needed_x = ceil(f32(fresh_ix) / f32(4u*rendering_info.anti_alias_passes));
     // atomically set the maximum x work dimension for the next pass
-    _ = atomicMax(&bvh__namespaced__workgroups[0], needed_x);
+    _ = atomicMax(&bvh__namespaced__workgroups[0], u32(needed_x));
     //////////////////////////////
     /// setters
     // set t and ix
     var new_min_t_and_sphere: t_and_ix;
     new_min_t_and_sphere.t = new_hit_t;
     new_min_t_and_sphere.ix = new_sphere;
-    t_and_ix_to_u32(bvh__namespaced__hit_sphere_min[fresh_ix], &new_min_t_and_sphere);
+    bvh__namespaced__hit_sphere_min[(y_coord * rendering_info.real_canvas_width + x_coord) + (cwch * z_coord)] = t_and_ix_to_u32(&new_min_t_and_sphere);
     // set xy coord
-    bvh__namespaced__node_xycoord[fresh_ix] = write_y_at_bitmask(write_x_at_bitmask(0u, x_coord), y_coord);
+    bvh__namespaced__node_xycoord[fresh_ix] = write_z_at_bitmask(write_y_at_bitmask(write_x_at_bitmask(0u, x_coord), y_coord), z_coord);
     // set the branch, which contains stack and branching info
     bvh__namespaced__branch_bitmask[fresh_ix] =
       write_stack_at_bitmask(
-        write_at_level(
-          write_at_level(
-            current_bvh_lr_bitmask, current_bvh_stack, false,
+        write_at_right(
+          write_at_left(
+            current_bvh_lr_bitmask, current_bvh_stack,
             select(
               select(
                 select(
@@ -410,9 +434,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               ),
               false,
               obj_is_sphere
-            ), 
+            )), 
             // second write at level
-            current_bvh_stack, true,
+            current_bvh_stack,
               select(
                 select(
                   select(
@@ -797,8 +821,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
-    logShow bvhNodes
-    logShow spheres
+    -- logShow bvhNodes
+    -- logShow spheres
     bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
     let nSpheres = NEA.length spheres
     let nBVHNodes = NEA.length bvhNodes
@@ -820,7 +844,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     bvh__namespaced__node_ix <- buffMe
     bvh__namespaced__node_xycoord <- buffMe
     bvh__namespaced__branch_bitmask <- buffMe -- arr, 0/1 for tf, alternating l/r
-    hitsBuffer <- buffMe
+    bvh__namespaced__workgroups__a <- liftEffect $ createBuffer device $ x
+      { size: 16
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+      }
+    bvh__namespaced__workgroups__b <- liftEffect $ createBuffer device $ x
+      { size: 16
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+      }
     rawColorBuffer <- liftEffect $ createBuffer device $ x
       { size: maxColorBufferSize
       , usage: GPUBufferUsage.storage
@@ -853,8 +884,27 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , entryPoint: "main"
         }
     let
+      clearWorkgroupsDesc = x
+        { code: intercalate "\n"
+            [ """
+  // main
+@group(2) @binding(0) var<storage, read_write> bvh__namespaced__workgroups: array<u32>;
+@compute @workgroup_size(32, 1, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  bvh__namespaced__workgroups[global_id.x] = 4u;
+}
+"""
+            ]
+        }
+    clearWorkgroupsModule <- liftEffect $ createShaderModule device clearWorkgroupsDesc
+    let
+      (clearWorkgroupsStage :: GPUProgrammableStage) = x
+        { "module": clearWorkgroupsModule
+        , entryPoint: "main"
+        }
+    let
       hitDesc = x
-        { code: spy "hitDesc" $ intercalate "\n"
+        { code: intercalate "\n"
             [ lerp
             , lerpv
             , inputData
@@ -868,47 +918,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             , bvhNode
             , sphereBoundingBox
             , usefulConsts
-            , """
-// main
-@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct; // combine to single reader
-@group(0) @binding(1) var<storage, read> sphere_info : array<f32>; // combine to single reader
-@group(0) @binding(2) var<storage, read> bvh_info : array<bvh_node>; // combine to single reader
-@compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >  rendering_info.anti_alias_passes) {
-    return;
-  }
-  var dbg_id = global_id.y * rendering_info.real_canvas_width + global_id.x;
-  var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
-  var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
-  var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
-  var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
-  var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
-  var alias_pass = global_id.z;
-  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
-  var r: ray;
-  r.origin = origin;
-  r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
-  var hit_t: f32 = 0.42424242424242;
-  """
             , hitMain
-                ( HitBVHInfo
-                    {  nodesName: "bvh_info"
-                    , spheresName: "sphere_info"
-                    , rName: "r"
-                    , tMinName: "0.0001"
-                    , tMaxName: "1000.f"
-                    , hitTName: "hit_t"
-                    }
-                )
-            , """ 
-  if (bvh__return__hit) {
-    var sphere_idx = f32(bvh__return__ix);
-    var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
-    result_array[idx] = pack2x16float(vec2<f32>(sphere_idx, hit_t));
-  }
-}"""
             ]
         }
     hitModule <- liftEffect $ createShaderModule device hitDesc
@@ -1056,6 +1066,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+              , label: "readerBindGroupLayout"
           }
     rBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
@@ -1065,6 +1076,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+              , label: "rBindGroupLayout"
           }
     hitsStackBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
@@ -1074,6 +1086,17 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               )
+              , label: "hitsStackBindGroupLayout"
+          }
+    hitsWorkgroupBindGroupLayout <- liftEffect $ createBindGroupLayout device
+      $ x
+          { entries:
+              ( (0 .. 0) <#> \n -> gpuBindGroupLayoutEntry n GPUShaderStage.compute
+                  ( x { type: GPUBufferBindingType.storage }
+                      :: GPUBufferBindingLayout
+                  )
+              )
+              , label: "hitsWorkgroupBindGroupLayout"
           }
     wBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
@@ -1083,16 +1106,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+              , label: "wBindGroupLayout"
           }
     let debugBindGroupLayout = wBindGroupLayout
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
     hitsPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, debugBindGroupLayout
-      -- comment me back in when stuff is sorted out!!
-      --, hitsStackBindGroupLayout 
-      ] }
+      { bindGroupLayouts:
+          [ readerBindGroupLayout
+          , hitsStackBindGroupLayout
+          , hitsWorkgroupBindGroupLayout
+          ]
+      }
     -- for when we are reading from a context, taking an input, and transforming it
     -- to an output
     readIOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
@@ -1107,20 +1133,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , gpuBindGroupEntry 2
               (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
           ]
-      }
-    wHitsBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: hitsBuffer } :: GPUBufferBinding)
-          ]
+      , label: "readerBindGroup"
       }
     rHitsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: rBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
-              (x { buffer: hitsBuffer } :: GPUBufferBinding)
+              (x { buffer: bvh__namespaced__hit_sphere_min } :: GPUBufferBinding)
           ]
+      , label: "rHitsBindGroup"
       }
     wColorsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
@@ -1128,6 +1149,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: rawColorBuffer } :: GPUBufferBinding)
           ]
+      , label: "wColorsBindGroup"
       }
     rColorsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: rBindGroupLayout
@@ -1135,6 +1157,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: rawColorBuffer } :: GPUBufferBinding)
           ]
+      , label: "rColorsBindGroup"
       }
     wCanvasBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
@@ -1142,6 +1165,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
+      , label: "wCanvasBindGroup"
       }
     debugBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: debugBindGroupLayout
@@ -1149,6 +1173,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: debugBuffer } :: GPUBufferBinding)
           ]
+          , label: "debugBindGroup"
       }
     hitsStackBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: hitsStackBindGroupLayout
@@ -1160,22 +1185,50 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             ] # mapWithIndex \i n -> gpuBindGroupEntry i
               (x { buffer: n } :: GPUBufferBinding)
           )
+      , label: "hitsStackBindGroup"
+      }
+    workgroupBindGroupA <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          ( [ bvh__namespaced__workgroups__a
+            ] # mapWithIndex \i n -> gpuBindGroupEntry i
+              (x { buffer: n } :: GPUBufferBinding)
+          )
+      , label: "workgroupBindGroupA"
+      }
+    workgroupBindGroupB <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          ( [ bvh__namespaced__workgroups__b
+            ] # mapWithIndex \i n -> gpuBindGroupEntry i
+              (x { buffer: n } :: GPUBufferBinding)
+          )
+      , label: "workgroupBindGroupB"
       }
     clearBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: clearBufferStage
+      , label: "clearBufferPipeline"
+      }
+    clearWorkgroupsPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: hitsPipelineLayout
+      , compute: clearWorkgroupsStage
+      , label: "clearWorkgroupsPipeline"
       }
     hitComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: hitsPipelineLayout
       , compute: hitStage
+      , label: "hitComputePipeline"
       }
     colorFillComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readIOPipelineLayout
       , compute: colorFillStage
+      , label: "colorFillComputePipeline"
       }
     antiAliasComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readIOPipelineLayout
       , compute: antiAliasStage
+      , label: "antiAliasComputePipeline"
       }
 
     let
@@ -1222,32 +1275,38 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
         -- not necessary in the loop, but useful as a stress test for animating positions
         computePassEncoder <- beginComputePass commandEncoder (x {})
-        -- clear spheres as they're subject to an atomic operation
+        -- clear hits as they're subject to an atomic operation
         GPUComputePassEncoder.setPipeline computePassEncoder clearBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wHitsBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
         -- clear colors as they're subject to an atomic operation
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
         -- set this and leave it there, as this won't change
         -- comment me back in once stuff is sorted out
-        --GPUComputePassEncoder.setBindGroup computePassEncoder 3 hitsStackBindGroup
         let
           work n = do
             -- get hits
-            GPUComputePassEncoder.setBindGroup computePassEncoder 1
-              wHitsBindGroup
-            GPUComputePassEncoder.setBindGroup computePassEncoder 2
-              debugBindGroup
-            GPUComputePassEncoder.setPipeline computePassEncoder
-              hitComputePipeline
             let
               workwork m = do
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) (antiAliasPasses)
+                --let readA = m `mod` 2 == 0
+                --let indirectRead = if readA then bvh__namespaced__workgroups__a else bvh__namespaced__workgroups__b
+                --let indirectWrite = if readA then workgroupBindGroupB else workgroupBindGroupA
+                --GPUComputePassEncoder.setBindGroup computePassEncoder 2 indirectWrite
+                -- GPUComputePassEncoder.setPipeline computePassEncoder
+                --   clearWorkgroupsPipeline
+                -- GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+                -- GPUComputePassEncoder.setPipeline computePassEncoder
+                --   hitComputePipeline
+                --GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 12 12 12
+                --GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder bvh__namespaced__workgroups__a 0
+                pure unit
+            GPUComputePassEncoder.setPipeline computePassEncoder
+                  hitComputePipeline
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1 hitsStackBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2 workgroupBindGroupA
             foreachE (1 .. 128) workwork -- steps in computation 
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
