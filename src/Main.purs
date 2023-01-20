@@ -95,6 +95,76 @@ struct rendering_info_struct {
 }
 """
 
+
+readWriteAtLevel :: String
+readWriteAtLevel =
+  """
+fn read_at_level(bitmask: u32, level: u32, lr: bool) -> bool {
+  var spot = level * 2u + select(1u, 0u, lr);
+  return (bitmask & (1u << spot)) != 0;
+}
+fn read_at_left(bitmask: u32, level: u32) -> bool {
+  return read_at_level(bitmask, level, true);
+}
+fn read_at_right(bitmask: u32, level: u32) -> bool {
+  return read_at_level(bitmask, level, false);
+}
+fn write_at_level(bitmask: u32, level: u32, lr: bool, val: bool) -> u32 {
+  var spot = level * 2u + select(1u, 0u, lr);
+  return select(bitmask & ~ (1u << spot), bitmask | (1u << spot), val);
+}
+fn write_at_left(bitmask: u32, level: u32, val: bool) -> u32 {
+  return write_at_level(bitmask, level, true, val);
+}
+fn write_at_right(bitmask: u32, level: u32, val: bool) -> u32 {
+  return write_at_level(bitmask, level, false, val);
+}
+fn read_stack_at_bitmask(bitmask: u32) -> u32 {
+  return bitmask >> 24;
+}
+fn write_stack_at_bitmask(bitmask: u32, stack: u32) -> u32 {
+  return (bitmask & 0xFFFFFF) | (stack << 24);
+}
+fn read_x_at_bitmask(xyz: u32) -> u32 {
+  return xyz & 0x3fff; // range [0,14)
+}
+fn read_y_at_bitmask(xyz: u32) -> u32 {
+  return (xyz >> 14u) & 0x3fff; // range [14,28)
+}
+fn read_z_at_bitmask(xyz: u32) -> u32 {
+  return xyz >> 28u; // range [28,32)
+}
+fn write_x_at_bitmask(xyz: u32, x: u32) -> u32 {
+  return (xyz & 0xFFFFC000) | x;
+}
+fn write_y_at_bitmask(xyz: u32, y: u32) -> u32 {
+  return (xyz & 0xFFFC3FFF) | (y << 14u);
+}
+fn write_z_at_bitmask(xyz: u32, z: u32) -> u32 {
+  return (xyz & 0x3FFFFFFF) | (z << 28u);
+}
+  """
+
+getTAndIx :: String
+getTAndIx =
+  """
+struct t_and_ix {
+  t: f32,
+  ix: u32
+}
+
+fn u32_to_t_and_ix(i: u32, p: ptr<function, t_and_ix>) -> bool {
+  var out = unpack2x16float(i);
+  (*p).t = out.y;
+  (*p).ix = u32(out.x);
+  return true;
+}
+
+fn t_and_ix_to_u32(p: ptr<function, t_and_ix>) -> u32 {
+  // offset by 0.1 to prevent rounding errors when stored
+  return pack2x16float(vec2(f32((*p).ix)+0.1, (*p).t));
+}
+  """
 aabb :: String
 aabb =
   """
@@ -175,8 +245,9 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
  // we make our stack 100-deep, which is more than enough for our purposes
-  var bvh__namespaced__on_left = array<bool, 100>();
-  var bvh__namespaced__on_right = array<bool, 100>();
+  //var bvh__namespaced__on_left = array<bool, 100>();
+  //var bvh__namespaced__on_right = array<bool, 100>();
+  var bvh__namespaced__bitmask = 0u;
   var bvh__namespaced__sphere_left = array<u32, 100>();
   var bvh__namespaced__sphere_right = array<u32, 100>();
   var bvh__namespaced__hit_t_left = array<f32, 100>();
@@ -212,10 +283,10 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
     ///
     var was_aabb_hit = aabb_hit(&bvh__namespaced__tmp_box, bvh__namespaced__r, bvh__namespaced__t_min, bvh__namespaced__t_max);
     var obj_is_sphere = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).is_sphere == 1u;
-    var not_left = !bvh__namespaced__on_left[bvh__namespaced__stack];
-    var loop_completed = bvh__namespaced__on_left[bvh__namespaced__stack] && bvh__namespaced__on_right[bvh__namespaced__stack];
+    var not_left = !read_at_left(bvh__namespaced__bitmask, bvh__namespaced__stack);
+    var loop_completed = read_at_left(bvh__namespaced__bitmask, bvh__namespaced__stack) && read_at_right(bvh__namespaced__bitmask, bvh__namespaced__stack);
     var stack_is_0 = bvh__namespaced__stack == 0u;
-    var up_1_on_right = bvh__namespaced__on_right[bvh__namespaced__stack - 1];
+    var up_1_on_right = read_at_right(bvh__namespaced__bitmask, bvh__namespaced__stack - 1);
     var up_1_on_left = !up_1_on_right;
     ///
     var min_t = select(
@@ -347,8 +418,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
       );
     /////////// first draft completed
     // always anchor left/right on old_bvh__namespaced__stack
-    bvh__namespaced__on_left[old_bvh__namespaced__stack] =
-      select(
+    bvh__namespaced__bitmask = write_at_left(bvh__namespaced__bitmask, old_bvh__namespaced__stack, select(
         select(
           select(
             true,
@@ -361,10 +431,10 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         ),
         false,
         obj_is_sphere
-      );
+      ));
     /////// first draft completed
     // always anchor left/right on old_bvh__namespaced__stack
-    bvh__namespaced__on_right[old_bvh__namespaced__stack] =
+    bvh__namespaced__bitmask = write_at_right(bvh__namespaced__bitmask, old_bvh__namespaced__stack,
       select(
         select(
           select(
@@ -377,7 +447,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         ),
         false,
         obj_is_sphere
-      );
+      ));
     ///////////// first draft done
     // if the stack has incremented, we set the parent node to old_bvh__namespaced__node_ix
     var old_parent_node = bvh__namespaced__parent_node[bvh__namespaced__stack];
@@ -843,6 +913,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             , pointAtParameter
             , hitSphere
             , aabb
+            , getTAndIx
+            , readWriteAtLevel
             , bvhNode
             , sphereBoundingBox
             , usefulConsts
