@@ -438,7 +438,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
     if (stack_is_0 && obj_is_sphere) { break; }
     if (stack_is_0 && !was_aabb_hit) { break; }
     if (stack_is_0 && loop_completed) { break; }
-    break; // debug for testing
+    //break; // debug for testing
   }
 """
   ]
@@ -1202,7 +1202,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                                       GPUComputePassEncoder.setBindGroup computePassEncoder 2
                                         debugBindGroup
                                       GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
-            foreachE (0 .. 128) workwork
+            foreachE (1 .. 1) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
@@ -1211,7 +1211,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
             GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
-        foreachE (0 .. 31) work
+        foreachE (1 .. 1) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           rColorsBindGroup
