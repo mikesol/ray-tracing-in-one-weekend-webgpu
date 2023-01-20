@@ -7,7 +7,7 @@ import Control.Lazy (fix)
 import Control.Monad.Gen (elements)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (intercalate, length)
+import Data.Array (intercalate, length, replicate)
 import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, mapWithIndex, snoc, snoc', sortBy, take, toArray, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
@@ -24,7 +24,7 @@ import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype, unwrap)
 import Data.NonEmpty (NonEmpty(..))
-import Data.Traversable (traverse)
+import Data.Traversable (sequence, sequence_, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
 import Debug (spy)
@@ -37,7 +37,7 @@ import Effect (Effect)
 import Effect.Aff (Milliseconds(..), delay, error, launchAff_, throwError)
 import Effect.Class (liftEffect)
 import Effect.Class.Console (logShow)
-import Effect.Random (randomInt)
+import Effect.Random (random, randomInt)
 import Effect.Ref as Ref
 import FRP.Event (create)
 import QualifiedDo.Alt as Alt
@@ -94,6 +94,7 @@ struct rendering_info_struct {
   current_time: f32 // current time in seconds
 }
 """
+
 aabb :: String
 aabb =
   """
@@ -592,7 +593,7 @@ newtype BVHNode = BVHNode
   }
 
 derive instance Newtype BVHNode _
-derive newtype instance Show BVHNode 
+derive newtype instance Show BVHNode
 
 type Sphere' =
   { cx :: Number
@@ -604,7 +605,7 @@ type Sphere' =
 newtype Sphere = Sphere Sphere'
 
 derive instance Newtype Sphere _
-derive newtype instance Show Sphere 
+derive newtype instance Show Sphere
 
 data Axis = XAxis | YAxis | ZAxis
 
@@ -794,6 +795,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
+    randos <- liftEffect $ sequence_ $ replicate 100 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -846,19 +848,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     let
       hitDesc = x
-        { code:  spy "hitDesc" $ intercalate "\n"
-              [ lerp
-              , lerpv
-              , inputData
-              , ray
-              , antiAliasFuzzing
-              , pointAtParameter
-              , hitSphere
-              , aabb
-              , bvhNode
-              , sphereBoundingBox
-              , usefulConsts
-              , """
+        { code: spy "hitDesc" $ intercalate "\n"
+            [ lerp
+            , lerpv
+            , inputData
+            , ray
+            , antiAliasFuzzing
+            , pointAtParameter
+            , hitSphere
+            , aabb
+            , bvhNode
+            , sphereBoundingBox
+            , usefulConsts
+            , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
@@ -884,25 +886,25 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
   var hit_t: f32 = 0.42424242424242;
   """
-              , hitBVHNode
-                  ( HitBVHInfo
-                      { startNodeIx: "rendering_info.n_bvh_nodes - 1"
-                      , nodesName: "bvh_info"
-                      , spheresName: "sphere_info"
-                      , rName: "r"
-                      , tMinName: "0.0001"
-                      , tMaxName: "1000.f"
-                      , hitTName: "hit_t"
-                      }
-                  )
-              , """ 
+            , hitBVHNode
+                ( HitBVHInfo
+                    { startNodeIx: "rendering_info.n_bvh_nodes - 1"
+                    , nodesName: "bvh_info"
+                    , spheresName: "sphere_info"
+                    , rName: "r"
+                    , tMinName: "0.0001"
+                    , tMaxName: "1000.f"
+                    , hitTName: "hit_t"
+                    }
+                )
+            , """ 
   if (bvh__return__hit) {
     var sphere_idx = f32(bvh__return__ix);
     var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
     result_array[idx] = pack2x16float(vec2<f32>(sphere_idx, hit_t));
   }
 }"""
-              ]
+            ]
         }
     hitModule <- liftEffect $ createShaderModule device hitDesc
     let
@@ -1235,11 +1237,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
           (x { texture: colorTexture })
           (gpuExtent3DWH canvasWidth canvasHeight)
-        copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536  
+        copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
         launchAff_ do
-          toAffE $ convertPromise <$> if whichLoop == 100 then mapAsync debugOutputBuffer GPUMapMode.read else  onSubmittedWorkDone queue
+          toAffE $ convertPromise <$> if whichLoop == 100 then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
           liftEffect do
             when (whichLoop == 100) do
               bfr <- getMappedRange debugOutputBuffer
@@ -1281,5 +1283,5 @@ main = do
       , D.div
           Alt.do
             id_ "debug-gpu"
-          [     ]
+          []
       ]
