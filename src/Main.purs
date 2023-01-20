@@ -7,7 +7,7 @@ import Control.Lazy (fix)
 import Control.Monad.Gen (elements)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (intercalate, length, replicate)
+import Data.Array (intercalate, length, replicate, (..))
 import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, mapWithIndex, snoc, snoc', sortBy, take, toArray, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
@@ -33,7 +33,7 @@ import Deku.Attributes (id_, klass_)
 import Deku.Control (text, text_, (<#~>))
 import Deku.DOM as D
 import Deku.Toplevel (runInBody)
-import Effect (Effect)
+import Effect (Effect, foreachE)
 import Effect.Aff (Milliseconds(..), delay, error, launchAff_, throwError)
 import Effect.Class (liftEffect)
 import Effect.Class.Console (logShow)
@@ -438,6 +438,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
     if (stack_is_0 && obj_is_sphere) { break; }
     if (stack_is_0 && !was_aabb_hit) { break; }
     if (stack_is_0 && loop_completed) { break; }
+    break; // debug for testing
   }
 """
   ]
@@ -783,8 +784,9 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
-         ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-          ] <> randos)
+          ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
+            ] <> randos
+          )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
     logShow bvhNodes
@@ -1189,22 +1191,27 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
-        -- get hits
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wHitsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          debugBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          hitComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
-        -- colorFill
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          rHitsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          wColorsBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          colorFillComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+        let
+          work n = do
+            -- get hits
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              hitComputePipeline
+            let workwork m = do
+                                      GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                                        wHitsBindGroup
+                                      GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                                        debugBindGroup
+                                      GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
+            foreachE (0 .. 128) workwork
+            -- colorFill
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              rHitsBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wColorsBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              colorFillComputePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
+        foreachE (0 .. 31) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           rColorsBindGroup
@@ -1258,7 +1265,7 @@ main = do
           []
       , D.div
           Alt.do
-            klass_ "absolute p-3 text-white"
+            klass_ "absolute p-3 text-slate-400"
           [ errorMessage.event $> false <|> pure true <#~>
               if _ then
                 text (_.avgTime >>> show >>> ("Avg time: " <> _) <$> frameInfo.event)
