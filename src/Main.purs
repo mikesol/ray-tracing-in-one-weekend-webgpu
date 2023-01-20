@@ -174,9 +174,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   , "  var bvh__namespaced__t_max = " <> tMaxName <> ";"
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
-
-
-  // we make our stack 100-deep, which is more than enough for our purposes
+ // we make our stack 100-deep, which is more than enough for our purposes
   var bvh__namespaced__on_left = array<bool, 100>();
   var bvh__namespaced__on_right = array<bool, 100>();
   var bvh__namespaced__sphere_left = array<u32, 100>();
@@ -195,265 +193,251 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   var my_id = (rendering_info.canvas_height * rendering_info.real_canvas_width) - 444u;
   var dbg_cond = select(false, true, dbg_id == my_id);
 
+  //////////////
+  // as branching causes bugs in windows (and perhaps other platforms), we run this entirely on select statements
   loop {
-    debug_idx++;
-    if (debug_idx > 1000u) { break; } // GUARD
-    if (dbg_cond) { dbar_array[dbar_idx] = 0; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = debug_idx; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = 16; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = 17; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = 18; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = u32(bvh__namespaced__on_left[bvh__namespaced__stack]); }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = 19; }
-    dbar_idx++;
-    if (dbg_cond) { dbar_array[dbar_idx] = u32(bvh__namespaced__on_right[bvh__namespaced__stack]); }
-    dbar_idx++;
-    ////////////////////
-    ////////////////////
-    // if bvh__namespaced__tmp_node is a sphere, we have a special flow and we short-circuit the left/right behavior
-    if (((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).is_sphere == 1u) {
-      var sphere_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left * 4u;
-      var sphere_hit = hit_sphere(
-        (*bvh__namespaced__spheres)[sphere_ix],
-        (*bvh__namespaced__spheres)[sphere_ix+1],
-        (*bvh__namespaced__spheres)[sphere_ix+2],
-        (*bvh__namespaced__spheres)[sphere_ix+3],
-        bvh__namespaced__r,
-        bvh__namespaced__t_min,
-        bvh__namespaced__t_max,
-        bvh__namespaced_t);
-      // in the unlikely event that our model has one sphere, we can short-circuit the rest of the logic
-      if (bvh__namespaced__stack == 0u) {
-        bvh__return__hit = sphere_hit;
-        if (bvh__return__hit) {
-          bvh__return__ix = sphere_ix / 4;
-        }
-        if (dbg_cond) { dbar_array[dbar_idx] = 1; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 42; }
-        dbar_idx++;
-        break;
-      }
-      // if so, report back a hit
-      if (sphere_hit) {
-        // increment by 1 to indicate a hit
-        var i_plus_1 = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left + 1u;
-        if (bvh__namespaced__on_right[bvh__namespaced__stack - 1]) {
-          bvh__namespaced__sphere_right[bvh__namespaced__stack - 1] = i_plus_1;
-          bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1] = *bvh__namespaced_t;
-        } else {
-          bvh__namespaced__sphere_left[bvh__namespaced__stack - 1] = i_plus_1;
-          bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1] = *bvh__namespaced_t;
-        }
-        if (dbg_cond) { dbar_array[dbar_idx] = 2; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = i_plus_1; }
-        dbar_idx++;
-      } else {
-        // if not, report back a miss
-        if (bvh__namespaced__on_right[bvh__namespaced__stack - 1]) {
-          bvh__namespaced__sphere_right[bvh__namespaced__stack - 1] = 0;
-          bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1] = -1.0;
-        } else {
-          bvh__namespaced__sphere_left[bvh__namespaced__stack - 1] = 0;
-          bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1] = -1.0;
-        }
-        if (dbg_cond) { dbar_array[dbar_idx] = 3; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 666; }
-        dbar_idx++;
-      }
-      // set the temp node back to the parent
-      bvh__namespaced__node_ix = bvh__namespaced__parent_node[bvh__namespaced__stack];
-      // decrease the counter
-      bvh__namespaced__stack--;
-      if (dbg_cond) { dbar_array[dbar_idx] = 4; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = 5; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-      dbar_idx++;
-      continue;
-    }
-    ////////////////////
-    ////////////////////
-    // we haven't yet started analyzing this box, attempt to fail fast
-    if (!bvh__namespaced__on_left[bvh__namespaced__stack]) {
-      // populate a bounding box with this node's information
-      bvh_node_bounding_box((*bvh__namespaced__nodes)[bvh__namespaced__node_ix], &bvh__namespaced__tmp_box);
-      if (aabb_hit(&bvh__namespaced__tmp_box, bvh__namespaced__r, bvh__namespaced__t_min, bvh__namespaced__t_max)) {
-        // we dip into the left
-        var left_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left;
-        bvh__namespaced__on_left[bvh__namespaced__stack] = true;
-        // increase the stack
-        bvh__namespaced__stack++;
-        // set the parent to this node index
-        bvh__namespaced__parent_node[bvh__namespaced__stack] = bvh__namespaced__node_ix;
-        // change the current node index now that the parent is set
-        bvh__namespaced__node_ix = left_ix;
-        if (dbg_cond) { dbar_array[dbar_idx] = 6; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 7; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-        dbar_idx++;
-        continue;
-      } else { 
-        // we have a miss
-        if (bvh__namespaced__stack == 0u) {
-          // we're done as there won't be a hit at this point
-          if (dbg_cond) { dbar_array[dbar_idx] = 8; }
-          dbar_idx++;
-          if (dbg_cond) { dbar_array[dbar_idx] = 1024; }
-          dbar_idx++;
-          break;
-        }
-        // set the previous level's t to -1.0 as we missed
-        if (bvh__namespaced__on_right[bvh__namespaced__stack-1u]) {
-          bvh__namespaced__hit_t_right[bvh__namespaced__stack-1u] = -1.0;
-        } else {
-          bvh__namespaced__hit_t_left[bvh__namespaced__stack-1u] = -1.0;
-        }
-        // set the previous level's object to 0 as we missed
-        if (bvh__namespaced__on_right[bvh__namespaced__stack-1u]) {
-          bvh__namespaced__sphere_right[bvh__namespaced__stack-1u] = 0;
-        } else {
-          bvh__namespaced__sphere_left[bvh__namespaced__stack-1u] = 0;
-        }
-        // set the node index to the parent's index
-        bvh__namespaced__node_ix = bvh__namespaced__parent_node[bvh__namespaced__stack];
-        // decrease the stack
-        bvh__namespaced__stack--;
-        if (dbg_cond) { dbar_array[dbar_idx] = 9; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 10; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-        dbar_idx++;
-        continue;
-      }
-    }
-    /////////////////
-    /////////////////
-    // we're at the end of a hit comparison
-    if (bvh__namespaced__on_left[bvh__namespaced__stack] && bvh__namespaced__on_right[bvh__namespaced__stack]) {
-      // take the min
-      var min_t = select(
+    ///
+    var sphere_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left * 4u;
+    var sphere_hit = hit_sphere(
+      (*bvh__namespaced__spheres)[sphere_ix],
+      (*bvh__namespaced__spheres)[sphere_ix+1],
+      (*bvh__namespaced__spheres)[sphere_ix+2],
+      (*bvh__namespaced__spheres)[sphere_ix+3],
+      bvh__namespaced__r,
+      bvh__namespaced__t_min,
+      bvh__namespaced__t_max,
+      bvh__namespaced_t);
+    ///
+    bvh_node_bounding_box((*bvh__namespaced__nodes)[bvh__namespaced__node_ix], &bvh__namespaced__tmp_box);
+    ///
+    var was_aabb_hit = aabb_hit(&bvh__namespaced__tmp_box, bvh__namespaced__r, bvh__namespaced__t_min, bvh__namespaced__t_max);
+    var obj_is_sphere = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).is_sphere == 1u;
+    var not_left = !bvh__namespaced__on_left[bvh__namespaced__stack];
+    var loop_completed = bvh__namespaced__on_left[bvh__namespaced__stack] && bvh__namespaced__on_right[bvh__namespaced__stack];
+    var stack_is_0 = bvh__namespaced__stack == 0u;
+    var up_1_on_right = bvh__namespaced__on_right[bvh__namespaced__stack - 1];
+    var up_1_on_left = !up_1_on_right;
+    ///
+    var min_t = select(
+      select(
+        select(bvh__namespaced__hit_t_right[bvh__namespaced__stack]
+          , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
+          , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < bvh__namespaced__hit_t_right[bvh__namespaced__stack])
+          , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
+          , bvh__namespaced__hit_t_right[bvh__namespaced__stack] < 0.f
+          )
+        , bvh__namespaced__hit_t_right[bvh__namespaced__stack]
+        , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < 0.f);
+    var winning_sphere = select(bvh__namespaced__sphere_left[bvh__namespaced__stack]
+        , bvh__namespaced__sphere_right[bvh__namespaced__stack]
+        , min_t == bvh__namespaced__hit_t_right[bvh__namespaced__stack]);
+    ///
+    var i_plus_1 = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left + 1u;
+    ///////////////
+    ///////////////
+    ///////////////
+    ///////////////
+    var old_hit_t_right_up_1 = bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1u];
+    bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1u] =
+      select(
         select(
-          select(bvh__namespaced__hit_t_right[bvh__namespaced__stack]
-            , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
-            , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < bvh__namespaced__hit_t_right[bvh__namespaced__stack])
-            , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
-            , bvh__namespaced__hit_t_right[bvh__namespaced__stack] < 0.f
-            )
-          , bvh__namespaced__hit_t_right[bvh__namespaced__stack]
-          , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < 0.f);
-      if (bvh__namespaced__stack == 0u) {
-        if (min_t < 0.f) {
-            // if both the mins are negative, then we have no hit, so the obj is 0
-            bvh__return__hit = false;
-        } else {
-          // select the correct object, remembering to subtract 1 as 0 represents an unfound object
-          bvh__return__ix = select(bvh__namespaced__sphere_left[0u]
-            , bvh__namespaced__sphere_right[0u]
-            , min_t == bvh__namespaced__hit_t_right[0u]) - 1; 
-          bvh__return__hit = true;
-          *bvh__namespaced_t = min_t;
-        }
-        if (dbg_cond) { dbar_array[dbar_idx] = 11; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 777; }
-        dbar_idx++;
-        // we're done!
-        break;
-      } else {
-        if (bvh__namespaced__on_right[bvh__namespaced__stack-1u]) {
-          bvh__namespaced__hit_t_right[bvh__namespaced__stack-1u] = min_t;
-        } else {
-          bvh__namespaced__hit_t_left[bvh__namespaced__stack-1u] = min_t;
-        }
-        // no need to add or subtract 1 to sphere index as we are just passing it through
-        var sphere_ix = select(bvh__namespaced__sphere_left[bvh__namespaced__stack]
-            , bvh__namespaced__sphere_right[bvh__namespaced__stack]
-            , min_t == bvh__namespaced__hit_t_right[bvh__namespaced__stack]);
-        if (bvh__namespaced__on_right[bvh__namespaced__stack-1u]) {
-          bvh__namespaced__sphere_right[bvh__namespaced__stack-1u] = sphere_ix;
-        } else {
-          bvh__namespaced__sphere_left[bvh__namespaced__stack-1u] = sphere_ix;
-        }
-        // mark both bools on this level as false
-        if (dbg_cond) { dbar_array[dbar_idx] = 22; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 24242; }
-        dbar_idx++;
-        bvh__namespaced__on_left[bvh__namespaced__stack] = false;
-        bvh__namespaced__on_right[bvh__namespaced__stack] = false;
-        // set the node ix to the parent
-        bvh__namespaced__node_ix = bvh__namespaced__parent_node[bvh__namespaced__stack];
-        // decrease the stack
-        bvh__namespaced__stack--;
-        if (dbg_cond) { dbar_array[dbar_idx] = 12; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = 13; }
-        dbar_idx++;
-        if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-        dbar_idx++;
-      }
-      continue;
-    }
-    ///////////////// 
-    /////////////////
-    if (bvh__namespaced__on_left[bvh__namespaced__stack]) {
-      // we dip into the right
-      var right_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).right;
-      bvh__namespaced__on_right[bvh__namespaced__stack] = true;
-      if (dbg_cond) { dbar_array[dbar_idx] = 20; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = 21; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = u32(bvh__namespaced__on_right[bvh__namespaced__stack]); }
-      dbar_idx++;
-      // increase the stack
-      bvh__namespaced__stack++;
-      // set the parent to this node index
-      bvh__namespaced__parent_node[bvh__namespaced__stack] = bvh__namespaced__node_ix;
-      // change the current node index now that the parent is set
-      bvh__namespaced__node_ix = right_ix;
-      if (dbg_cond) { dbar_array[dbar_idx] = 14; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__node_ix; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = 15; }
-      dbar_idx++;
-      if (dbg_cond) { dbar_array[dbar_idx] = bvh__namespaced__stack; }
-      dbar_idx++;
-      continue;
-    }
-    /////////////////
-    /////////////////
-    // panic!
-    // should never get here
-    break; // out of safety, but we really should never get here
+          select(
+            old_hit_t_right_up_1,
+            select(old_hit_t_right_up_1, min_t, up_1_on_right),
+            loop_completed
+          ),
+          select(old_hit_t_right_up_1, select(-1.f, old_hit_t_right_up_1, was_aabb_hit), up_1_on_right),
+          not_left
+        ),
+        select(old_hit_t_right_up_1, select(-1.f, *bvh__namespaced_t, sphere_hit), up_1_on_right),
+        obj_is_sphere
+      );
+    ///
+    var old_hit_t_left_up_1 = bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1u];
+    bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1u] =
+      select(
+        select(
+          select(
+            old_hit_t_left_up_1,
+            select(old_hit_t_left_up_1, min_t, up_1_on_left),
+            loop_completed
+          ),
+          select(old_hit_t_left_up_1, select(-1.f, old_hit_t_left_up_1, was_aabb_hit), up_1_on_left),
+          not_left
+        ),
+        select(old_hit_t_left_up_1, select(-1.f, *bvh__namespaced_t, sphere_hit), up_1_on_left),
+        obj_is_sphere
+      );
+    /// first draft done
+    var old_sphere_right_up_1 = bvh__namespaced__sphere_right[bvh__namespaced__stack - 1u];
+    bvh__namespaced__sphere_right[bvh__namespaced__stack - 1u] =
+      select(
+        select(
+          select(
+            old_sphere_right_up_1,
+            select(old_sphere_right_up_1, winning_sphere, up_1_on_right),
+            loop_completed
+          ),
+          select(old_sphere_right_up_1, select(0, old_sphere_right_up_1, was_aabb_hit), up_1_on_right),
+          not_left
+        ),
+        select(old_sphere_right_up_1, select(0, i_plus_1, sphere_hit), up_1_on_right),
+        obj_is_sphere
+      );
+    /// first draft done
+    var old_sphere_left_up_1 = bvh__namespaced__sphere_left[bvh__namespaced__stack - 1u];
+    bvh__namespaced__sphere_left[bvh__namespaced__stack - 1u] =
+      select(
+        select(
+          select(
+            old_sphere_left_up_1,
+            select(old_sphere_left_up_1, winning_sphere, up_1_on_left),
+            loop_completed
+          ),
+          select(old_sphere_left_up_1, select(0, old_sphere_left_up_1, was_aabb_hit), up_1_on_left),
+          not_left
+        ),
+        select(old_sphere_left_up_1, select(0, i_plus_1, sphere_hit), up_1_on_left),
+        obj_is_sphere
+      );
+    /// first draft done
+    var old_bvh__namespaced__node_ix = bvh__namespaced__node_ix;
+    bvh__namespaced__node_ix =
+      select(
+        select(
+          select(
+            // we're on the right branch, so focus on right
+            ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).right,
+            // when completed focus on parent
+            bvh__namespaced__parent_node[bvh__namespaced__stack],
+            loop_completed
+          ),
+          // if the box was hit, focus on the left node
+          // otherwise focus on the parent
+          select(
+            bvh__namespaced__parent_node[bvh__namespaced__stack],
+            ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left,
+            was_aabb_hit),
+          not_left
+        ),
+        bvh__namespaced__parent_node[bvh__namespaced__stack],
+        obj_is_sphere
+      );
+    /// first draft done
+    // don't worry about underflow here as 0 checks are based on old value
+    // if we are ever below 0, one of the break checks below should trigger
+    var old_bvh__namespaced__stack = bvh__namespaced__stack;
+    bvh__namespaced__stack =
+      select(
+        select(
+          select(
+            // always increment on right as we've tested already
+            old_bvh__namespaced__stack + 1,
+            // always go up a level if we've completed a loop
+            old_bvh__namespaced__stack - 1,
+            loop_completed
+          ),
+          // increment if we have a hit, decrement if we don't
+          select(old_bvh__namespaced__stack - 1, old_bvh__namespaced__stack + 1, was_aabb_hit),
+          not_left
+        ),
+        // always decrease when hitting sphere
+        old_bvh__namespaced__stack - 1,
+        obj_is_sphere
+      );
+    /////////// first draft completed
+    // always anchor left/right on old_bvh__namespaced__stack
+    bvh__namespaced__on_left[old_bvh__namespaced__stack] =
+      select(
+        select(
+          select(
+            true,
+            false,
+            loop_completed
+          ),
+          // if we haven't started the left yet, we only enter if aabb has been hit
+          was_aabb_hit,
+          not_left
+        ),
+        false,
+        obj_is_sphere
+      );
+    /////// first draft completed
+    // always anchor left/right on old_bvh__namespaced__stack
+    bvh__namespaced__on_right[old_bvh__namespaced__stack] =
+      select(
+        select(
+          select(
+            true,
+            false,
+            loop_completed
+          ),
+          false,
+          not_left
+        ),
+        false,
+        obj_is_sphere
+      );
+    ///////////// first draft done
+    // if the stack has incremented, we set the parent node to old_bvh__namespaced__node_ix
+    var old_parent_node = bvh__namespaced__parent_node[bvh__namespaced__stack];
+    bvh__namespaced__parent_node[bvh__namespaced__stack] =
+      select(
+        old_parent_node,
+        old_bvh__namespaced__node_ix,
+        bvh__namespaced__stack == old_bvh__namespaced__stack + 1);
+    ///// first draft done
+    *bvh__namespaced_t =
+      select(
+        select(
+          select(
+            0.0, // won't be used so it doesn't matter
+            min_t,
+            loop_completed
+          ),
+          0.0, // won't be used so it doesn't matter
+          not_left
+        ),
+        select(-1.0, *bvh__namespaced_t, sphere_hit),
+        obj_is_sphere
+      );
+    /////// first draft done
+    bvh__return__hit =
+      select(
+        select(
+          select(
+            false, // won't be used
+            min_t > 0.f,
+            loop_completed
+          ),
+          false, // won't be used
+          not_left
+        ),
+        sphere_hit,
+        obj_is_sphere
+      );
+    /////// first draft done
+    bvh__return__ix =
+      select(
+        select(
+          select(
+            0, // not used
+            // below will be a garbage value when we're not at 0
+            // but when we are it's the correct value
+            select(bvh__namespaced__sphere_left[0u]
+                , bvh__namespaced__sphere_right[0u]
+                , min_t == bvh__namespaced__hit_t_right[0u]) - 1,
+            loop_completed
+          ),
+          0, // not used
+          not_left
+        ),
+        sphere_ix / 4,
+        obj_is_sphere
+      );
+    if (stack_is_0 && obj_is_sphere) { break; }
+    if (stack_is_0 && !was_aabb_hit) { break; }
+    if (stack_is_0 && loop_completed) { break; }
   }
 """
   ]
@@ -795,12 +779,12 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence_ $ replicate 100 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
+    randos <- liftEffect $ sequence $ replicate 100 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
-          [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-          ]
+         ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
+          ] <> randos)
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
     logShow bvhNodes
