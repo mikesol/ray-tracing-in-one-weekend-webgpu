@@ -252,7 +252,7 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
 
-  var bvh__namespaced__node_ix = current_node_array[idx];
+  var bvh__namespaced__node_ix = current_node_array[idx] & 0x7fffffff;
   var bvh__namespaced__t_sphere = result_array[idx];
   var bvh__namespaced__bitmask = current_bitmask_array[idx];
   // bvh__namespaced__node_ix needed in array
@@ -388,12 +388,14 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
     ///// first draft done
     *bvh__namespaced_t = t_ix.t;
     bvh__namespaced__t_sphere = t_and_ix_to_u32(&t_ix);
-  // loopdebug
-//    if (stack_is_0 && obj_is_sphere) { break; }
-  // loopdebug
-//    if (stack_is_0 && !was_aabb_hit) { break; }
-  // loopdebug
-//    if (stack_is_0 && loop_completed) { break; }
+  if ((stack_is_0 && obj_is_sphere) ||
+      (stack_is_0 && !was_aabb_hit)  ||
+      (stack_is_0 && loop_completed))
+  { 
+    bvh__namespaced__node_ix = bvh__namespaced__node_ix | (1 << 31);
+      // loopdebug
+    // break;
+  }
     //break; // debug for testing
   // loopdebug
   /////////////////////////////}
@@ -887,8 +889,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >  rendering_info.anti_alias_passes) {
     return;
   }
-  var dbg_id = global_id.y * rendering_info.real_canvas_width + global_id.x;
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
+  var is_done = current_node_array[idx] & 0x80000000;
+  if (is_done > 0u) { return; }
+  var dbg_id = global_id.y * rendering_info.real_canvas_width + global_id.x;
   var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
@@ -900,7 +905,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
   var hit_t: f32 = 0.42424242424242;
-  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
   """
             , hitBVHNode
                 ( HitBVHInfo
@@ -1272,7 +1276,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             GPUComputePassEncoder.setPipeline computePassEncoder
               hitComputePipeline
             let
-              workwork m = do
+              workwork mm = do
+                let m = mm
                 GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
             foreachE (1 .. (nSpheres `shl` 1)) workwork
             -- colorFill
