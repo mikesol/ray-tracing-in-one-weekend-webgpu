@@ -6,7 +6,7 @@ import Control.Alt ((<|>))
 import Control.Lazy (fix)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (fold, length)
+import Data.Array (fold, length, replicate)
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
 import Data.ArrayBuffer.Typed (class TypedArray, buffer, fromArray, set, setTyped, whole)
 import Data.ArrayBuffer.Types (ArrayView, Float32Array)
@@ -15,6 +15,7 @@ import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
+import Data.Traversable (sequence)
 import Data.UInt (fromInt)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (klass_)
@@ -24,6 +25,7 @@ import Deku.Toplevel (runInBody)
 import Effect (Effect)
 import Effect.Aff (Milliseconds(..), delay, error, launchAff_, throwError)
 import Effect.Class (liftEffect)
+import Effect.Random (random)
 import Effect.Ref as Ref
 import FRP.Event (create)
 import QualifiedDo.Alt as Alt
@@ -61,6 +63,11 @@ import Web.HTML.HTMLCanvasElement (height, setHeight, setWidth, toElement, width
 import Web.HTML.Window (navigator, requestAnimationFrame)
 import Web.Promise as Web.Promise
 
+testNSpheres :: Int
+testNSpheres = 512
+testAntiAliasPasses :: Int
+testAntiAliasPasses = 8
+
 -- defs
 inputData :: String
 inputData =
@@ -77,7 +84,8 @@ struct rendering_info_struct {
 """
 
 antiAliasFuzzing :: String
-antiAliasFuzzing = """
+antiAliasFuzzing =
+  """
 const fuzz_fac = 0.5;
 const half_fuzz_fac = fuzz_fac / 2.0;
 fn fuzz2(i: u32, n: u32, d: u32) -> f32
@@ -250,17 +258,20 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: 24 -- align(4) size(24)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
+    randos <- liftEffect $ sequence $ join $ replicate (testNSpheres - 2) $ [ random <#> \n -> n * 8.0 - 4.0, pure 0.25, random <#> \n -> n * 8.0 - 4.0, pure 0.06 ]
+
     let
       rawSphereData = map fromNumber'
-        [ 0.0
-        , 0.0
-        , -1.0
-        , 0.5
-        , 0.0
-        , -100.5
-        , -1.0
-        , 100.0
-        ]
+        ( [ 0.0
+          , 0.0
+          , -1.0
+          , 0.5
+          , 0.0
+          , -100.5
+          , -1.0
+          , 100.0
+          ] <> randos
+        )
     let nSpheres = length rawSphereData / 4
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
     sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
@@ -327,8 +338,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
   var alias_pass = global_id.z / rendering_info.n_spheres; 
-  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.n_spheres) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.n_spheres) / f32(rendering_info.canvas_height);
+  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
+  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
   var sphere = global_id.z % rendering_info.n_spheres;
   var r: ray;
   r.origin = origin;
@@ -590,7 +601,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
+        let antiAliasPasses = testAntiAliasPasses -- $ ceil (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
         -- logShow antiAliasPasses
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
