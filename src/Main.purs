@@ -81,6 +81,15 @@ import Web.HTML.HTMLCanvasElement (height, setHeight, setWidth, toElement, width
 import Web.HTML.Window (navigator, requestAnimationFrame)
 import Web.Promise as Web.Promise
 
+testNSpheres :: Int
+testNSpheres = 512
+
+testAntiAliasMax :: Int
+testAntiAliasMax = 8
+
+testBounces :: Int
+testBounces = 32
+
 -- defs
 inputData :: String
 inputData =
@@ -96,7 +105,6 @@ struct rendering_info_struct {
   current_time: f32 // current time in seconds
 }
 """
-
 
 readWriteAtLevel :: String
 readWriteAtLevel =
@@ -167,6 +175,7 @@ fn t_and_ix_to_u32(p: ptr<function, t_and_ix>) -> u32 {
   return pack2x16float(vec2(f32((*p).ix)+0.1, (*p).t));
 }
   """
+
 aabb :: String
 aabb =
   """
@@ -744,7 +753,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
+    randos <- liftEffect $ sequence $ replicate (testNSpheres - 2) $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 8.0 - 4.0) <*> (random <#> \n -> n * 8.0 - 4.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -1113,7 +1122,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = 1 -- min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
+        let antiAliasPasses = testAntiAliasMax -- min testAntiAliasMax $ ceil (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * 4)))
         -- logShow antiAliasPasses
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
@@ -1151,11 +1160,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             -- get hits
             GPUComputePassEncoder.setPipeline computePassEncoder
               hitComputePipeline
-            let workwork m = do
-                                      GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                                        wHitsBindGroup
-                                      GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
-            foreachE (1 .. 1) workwork
+            let
+              workwork m = do
+                GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                  wHitsBindGroup
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
+            foreachE (1 .. testBounces) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
