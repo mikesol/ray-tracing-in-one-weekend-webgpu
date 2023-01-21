@@ -19,8 +19,8 @@ import Data.Float32 (fromNumber')
 import Data.Float32 as F
 import Data.Function (on)
 import Data.FunctorWithIndex (mapWithIndex)
-import Data.Int (ceil, floor, toNumber)
-import Data.Int.Bits (complement, (.&.))
+import Data.Int (ceil, floor, pow, toNumber)
+import Data.Int.Bits (complement, shl, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
@@ -258,7 +258,8 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
 
   //////////////
   // as branching causes bugs in windows (and perhaps other platforms), we run this entirely on select statements
-  loop {
+  // loopdebug
+  ///////////////////////loop {
     var t_ix: t_and_ix;
     u32_to_t_and_ix(bvh__namespaced__t_sphere, &t_ix);
     var bvh__namespaced__stack = read_stack_at_bitmask(bvh__namespaced__bitmask);
@@ -384,11 +385,15 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
     ///// first draft done
     *bvh__namespaced_t = t_ix.t;
     bvh__namespaced__t_sphere = t_and_ix_to_u32(&t_ix);
-    if (stack_is_0 && obj_is_sphere) { break; }
-    if (stack_is_0 && !was_aabb_hit) { break; }
-    if (stack_is_0 && loop_completed) { break; }
+  // loopdebug
+//    if (stack_is_0 && obj_is_sphere) { break; }
+  // loopdebug
+//    if (stack_is_0 && !was_aabb_hit) { break; }
+  // loopdebug
+//    if (stack_is_0 && loop_completed) { break; }
     //break; // debug for testing
-  }
+  // loopdebug
+  /////////////////////////////}
   current_node_array[idx] = bvh__namespaced__node_ix;
   current_bitmask_array[idx] = bvh__namespaced__bitmask;
   result_array[idx] = bvh__namespaced__t_sphere;
@@ -1209,7 +1214,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses = 1 -- min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
+        let antiAliasPasses = 8 -- min 16 $ floor (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
         -- logShow antiAliasPasses
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
@@ -1255,20 +1260,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wBitmaskBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
-
-
         ------------------------
         let
           work n = do
             -- get hits
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              hitsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               hitComputePipeline
             let
               workwork m = do
-                GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                  hitsBindGroup
+                --let m = 1
                 GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
-            foreachE (1 .. 1) workwork
+            foreachE (1 .. (nSpheres `shl` 1)) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
@@ -1277,7 +1281,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
             GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
-        foreachE (1 .. 1) work
+        foreachE (1 .. 32) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           rColorsBindGroup
