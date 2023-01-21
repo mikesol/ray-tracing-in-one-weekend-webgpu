@@ -764,22 +764,27 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     rawColorBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
+      , label: "rawColorBuffer"
       }
     hitsBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
+      , label: "hitsBuffer"
       }
     currentNodeBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
+      , label: "currentNodeBuffer"
       }
     currentBitmaskBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
+      , label: "currentBitmaskBuffer"
       }
     wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
+      , label: "wholeCanvasBuffer"
       }
     let
       clearBufferDesc = x
@@ -902,8 +907,8 @@ fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
-@group(1) @binding(0) var<storage, read> hit_info : array<u32>;
-@group(2) @binding(0) var<storage, read_write> result_array : array<atomic<u32>>;
+@group(1) @binding(0) var<storage, read_write> hit_info : array<u32>; // doesn't need to be write, but fits bind group
+@group(1) @binding(3) var<storage, read_write> result_array : array<atomic<u32>>;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >= rendering_info.anti_alias_passes) {
@@ -938,7 +943,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) * 3;
   _ = atomicAdd(&result_array[idx], u32(my_color.b * color_mult));
   _ = atomicAdd(&result_array[idx + 1],  u32(my_color.g * color_mult));
-  _ = atomicAdd(&result_array[idx + 2], u32(my_color.r * color_mult));
+  _ = atomicAdd(&result_array[idx + 2], u32(my_color.r * color_mult)); 
 }
 """
               ]
@@ -1010,6 +1015,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+          , label: "readerBindGroupLayout"
           }
     rBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
@@ -1019,6 +1025,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+          , label: "rBindGroupLayout"
           }
     wBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
@@ -1028,25 +1035,33 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+          , label: "wBindGroupLayout"
           }
-    hitsBindGroupLayout <- liftEffect $ createBindGroupLayout device
+    raytracingBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
-              (0 .. 2) <#> \i ->
+              (0 .. 3) <#> \i ->
                 gpuBindGroupLayoutEntry i GPUShaderStage.compute
                   ( x { type: GPUBufferBindingType.storage }
                       :: GPUBufferBindingLayout
                   )
+          , label: "raytracingBindGroupLayout"
           }
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
-    hitsPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, hitsBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ]
+      , label: "readOPipelineLayout"
+      }
+    raytracingPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, raytracingBindGroupLayout ]
+      , label: "raytracingPipelineLayout"
+      }
     -- for when we are reading from a context, taking an input, and transforming it
     -- to an output
     readIOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, rBindGroupLayout, wBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, rBindGroupLayout, wBindGroupLayout ]
+      , label: "readIOPipelineLayout"
+      }
     readerBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: readerBindGroupLayout
       , entries:
@@ -1057,6 +1072,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , gpuBindGroupEntry 2
               (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
           ]
+      , label: "readerBindGroup"
+      }
+    clearColorsBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+          ]
+      , label: "clearColorsBindGroup"
       }
     clearHitsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
@@ -1064,9 +1088,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: hitsBuffer } :: GPUBufferBinding)
           ]
+      , label: "clearHitsBindGroup"
       }
-    hitsBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: hitsBindGroupLayout
+    raytracingBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: raytracingBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: hitsBuffer } :: GPUBufferBinding)
@@ -1074,21 +1099,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: currentNodeBuffer } :: GPUBufferBinding)
           , gpuBindGroupEntry 2
               (x { buffer: currentBitmaskBuffer } :: GPUBufferBinding)
-          ]
-      }
-    rHitsBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: hitsBuffer } :: GPUBufferBinding)
-          ]
-      }
-    wColorsBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
+          , gpuBindGroupEntry 3
               (x { buffer: rawColorBuffer } :: GPUBufferBinding)
           ]
+      , label: "raytracingBindGroup"
       }
     rColorsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: rBindGroupLayout
@@ -1096,6 +1110,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: rawColorBuffer } :: GPUBufferBinding)
           ]
+      , label: "rColorsBindGroup"
       }
     wCanvasBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
@@ -1103,22 +1118,27 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
+      , label: "wCanvasBindGroup"
       }
     clearBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: clearBufferStage
+      , label: "clearBufferPipeline"
       }
     hitComputePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: hitsPipelineLayout
+      { layout: raytracingPipelineLayout
       , compute: hitStage
+      , label: "hitComputePipeline"
       }
     colorFillComputePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readIOPipelineLayout
+      { layout: raytracingPipelineLayout
       , compute: colorFillStage
+      , label: "colorFillComputePipeline"
       }
     antiAliasComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readIOPipelineLayout
       , compute: antiAliasStage
+      , label: "antiAliasComputePipeline"
       }
 
     let
@@ -1174,24 +1194,21 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
         -- clear colors as they're subject to an atomic operation
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wColorsBindGroup
+          clearColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1 raytracingBindGroup
         let
           work n = do
             -- get hits
-            GPUComputePassEncoder.setPipeline computePassEncoder
-              hitComputePipeline
             let
               workwork m = do
                 GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                  hitsBindGroup
+                  raytracingBindGroup
                 GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              hitComputePipeline
             foreachE (1 .. 1) workwork
             -- colorFill
-            GPUComputePassEncoder.setBindGroup computePassEncoder 1
-              rHitsBindGroup
-            GPUComputePassEncoder.setBindGroup computePassEncoder 2
-              wColorsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
             GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
