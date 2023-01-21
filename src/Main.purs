@@ -247,19 +247,16 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   , "  var bvh__namespaced__t_max = " <> tMaxName <> ";"
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
- // we make our stack 100-deep, which is more than enough for our purposes
-  //var bvh__namespaced__on_left = array<bool, 100>();
-  //var bvh__namespaced__on_right = array<bool, 100>();
+
+  // needed in array
   var bvh__namespaced__t_sphere = pack2x16float(vec2(0.0, 10000.f));
+  // needed in array
   var bvh__namespaced__bitmask = 0u;
+  // bvh__namespaced__node_ix needed in array
 
   var bvh__namespaced__tmp_box: aabb;
   var bvh__namespaced__stack = 0u;
-  var bvh__return__hit = false;
-  var bvh__return__ix = 0u;
 
-  var debug_idx = 0u;
-  var dbar_idx = 0u;
   var my_id = (rendering_info.canvas_height * rendering_info.real_canvas_width) - 444u;
   var dbg_cond = select(false, true, dbg_id == my_id);
 
@@ -389,8 +386,6 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
       ));
     ///// first draft done
     *bvh__namespaced_t = t_ix.t;
-    bvh__return__ix = t_ix.ix - 1u;
-    bvh__return__hit = t_ix.ix > 0u;
     bvh__namespaced__t_sphere = t_and_ix_to_u32(&t_ix);
     if (stack_is_0 && obj_is_sphere) { break; }
     if (stack_is_0 && !was_aabb_hit) { break; }
@@ -823,7 +818,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_info : array<bvh_node>;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
-@group(2) @binding(0) var<storage, read_write> dbar_array : array<u32>;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >  rendering_info.anti_alias_passes) {
@@ -855,11 +849,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                     }
                 )
             , """ 
-  if (bvh__return__hit) {
-    var sphere_idx = f32(bvh__return__ix);
-    var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
-    result_array[idx] = pack2x16float(vec2<f32>(sphere_idx, hit_t));
-  }
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
+  result_array[idx] = bvh__namespaced__t_sphere;
 }"""
             ]
         }
@@ -880,6 +871,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , antiAliasFuzzing
               , pointAtParameter
               , hitRecord
+              , getTAndIx
               , makeHitRec
               , usefulConsts
               , """
@@ -919,16 +911,16 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
   var hit_idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
-  var was_i_hit = hit_info[hit_idx];
+  var t_ix: t_and_ix;
+  u32_to_t_and_ix(hit_info[hit_idx], &t_ix);
+  var was_i_hit = t_ix.ix > 0;
   var my_color = vec3(0.0,0.0,0.0);
-  // my_color = sky_color(&r);
-  if (was_i_hit == 0u) {
+  if (!was_i_hit) {
     my_color = sky_color(&r);
   } else {
-    var unpacked = unpack2x16float(was_i_hit);
-    var sphere_idx = u32(unpacked[0]);
+    var sphere_idx = t_ix.ix - 1;
     var sphere_offset = sphere_idx * 4;
-    var norm_t = unpacked[1];
+    var norm_t = t_ix.t;
     var rec: hit_record;
     _ = make_hit_rec(sphere_info[sphere_offset], sphere_info[sphere_offset + 1], sphere_info[sphere_offset + 2], sphere_info[sphere_offset + 3], norm_t, &r, &rec);
     my_color = hit_color(&r, &rec);
@@ -1027,12 +1019,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                   )
               ]
           }
-    let debugBindGroupLayout = wBindGroupLayout
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
     readODebugPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
     -- for when we are reading from a context, taking an input, and transforming it
     -- to an output
     readIOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
@@ -1081,13 +1072,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
-          ]
-      }
-    debugBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: debugBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: debugBuffer } :: GPUBufferBinding)
           ]
       }
     clearBufferPipeline <- liftEffect $ createComputePipeline device $ x
@@ -1170,8 +1154,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             let workwork m = do
                                       GPUComputePassEncoder.setBindGroup computePassEncoder 1
                                         wHitsBindGroup
-                                      GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                                        debugBindGroup
                                       GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
             foreachE (1 .. 1) workwork
             -- colorFill
@@ -1199,13 +1181,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
           (x { texture: colorTexture })
           (gpuExtent3DWH canvasWidth canvasHeight)
-        copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
+        -- copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
+        let debugCondition = false -- whichLoop == 100
         launchAff_ do
-          toAffE $ convertPromise <$> if whichLoop == 100 then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
+          toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
           liftEffect do
-            when (whichLoop == 100) do
+            when debugCondition do
               bfr <- getMappedRange debugOutputBuffer
               buffy <- (Typed.whole bfr :: Effect Uint32Array) >>= Typed.toArray
               let _ = spy "buffy" buffy
