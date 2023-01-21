@@ -6,7 +6,7 @@ import Control.Alt ((<|>))
 import Control.Lazy (fix)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (fold, length, replicate)
+import Data.Array (fold, length, replicate, (..))
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
 import Data.ArrayBuffer.Typed (class TypedArray, buffer, fromArray, set, setTyped, whole)
 import Data.ArrayBuffer.Types (ArrayView, Float32Array)
@@ -22,7 +22,7 @@ import Deku.Attributes (klass_)
 import Deku.Control (text, text_, (<#~>))
 import Deku.DOM as D
 import Deku.Toplevel (runInBody)
-import Effect (Effect)
+import Effect (Effect, foreachE)
 import Effect.Aff (Milliseconds(..), delay, error, launchAff_, throwError)
 import Effect.Class (liftEffect)
 import Effect.Random (random)
@@ -65,8 +65,11 @@ import Web.Promise as Web.Promise
 
 testNSpheres :: Int
 testNSpheres = 512
+
 testAntiAliasPasses :: Int
 testAntiAliasPasses = 8
+
+testNBounces = 32
 
 -- defs
 inputData :: String
@@ -633,19 +636,22 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
-        -- spheres
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wHitsBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          hitComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY (nSpheres * antiAliasPasses)
-        -- colorFill
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          rHitsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          wColorsBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          colorFillComputePipeline
+        let
+          work n = do
+            -- spheres
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              wHitsBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              hitComputePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) (nSpheres * antiAliasPasses)
+            -- colorFill
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              rHitsBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wColorsBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              colorFillComputePipeline
+        foreachE (1 .. testNBounces) work
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
