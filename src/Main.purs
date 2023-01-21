@@ -1273,7 +1273,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               hitComputePipeline
             let
               workwork m = do
-                -- let m = 1
                 GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
             foreachE (1 .. (nSpheres `shl` 1)) workwork
             -- colorFill
