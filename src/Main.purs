@@ -8,7 +8,7 @@ import Control.Monad.Gen (elements)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
 import Data.Array (intercalate, length, replicate, (..))
-import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, mapWithIndex, snoc, snoc', sortBy, take, toArray, uncons)
+import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, snoc, snoc', sortBy, take, toArray, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
 import Data.ArrayBuffer.DataView as DV
@@ -18,10 +18,12 @@ import Data.ArrayBuffer.Types (ArrayView, Float32Array, Uint32Array)
 import Data.Float32 (fromNumber')
 import Data.Float32 as F
 import Data.Function (on)
+import Data.FunctorWithIndex (mapWithIndex)
 import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
-import Data.Maybe (Maybe(..), maybe)
+import Data.Map as Map
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Newtype (class Newtype, unwrap)
 import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
@@ -250,7 +252,6 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   //var bvh__namespaced__on_right = array<bool, 100>();
   var bvh__namespaced__t_sphere = pack2x16float(vec2(0.0, 10000.f));
   var bvh__namespaced__bitmask = 0u;
-  var bvh__namespaced__parent_node = array<u32, 100>();
 
   var bvh__namespaced__tmp_box: aabb;
   var bvh__namespaced__stack = 0u;
@@ -310,7 +311,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         obj_is_sphere
       );
     /// first draft done
-    var old_bvh__namespaced__node_ix = bvh__namespaced__node_ix;
+    var parent_node = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).parent;
     bvh__namespaced__node_ix =
       select(
         select(
@@ -318,18 +319,18 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
             // we're on the right branch, so focus on right
             ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).right,
             // when completed focus on parent
-            bvh__namespaced__parent_node[bvh__namespaced__stack],
+            parent_node,
             loop_completed
           ),
           // if the box was hit, focus on the left node
           // otherwise focus on the parent
           select(
-            bvh__namespaced__parent_node[bvh__namespaced__stack],
+            parent_node,
             ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left,
             was_aabb_hit),
           not_left
         ),
-        bvh__namespaced__parent_node[bvh__namespaced__stack],
+        parent_node,
         obj_is_sphere
       );
     /// first draft done
@@ -386,14 +387,6 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         false,
         obj_is_sphere
       ));
-    ///////////// first draft done
-    // if the stack has incremented, we set the parent node to old_bvh__namespaced__node_ix
-    var old_parent_node = bvh__namespaced__parent_node[bvh__namespaced__stack];
-    bvh__namespaced__parent_node[bvh__namespaced__stack] =
-      select(
-        old_parent_node,
-        old_bvh__namespaced__node_ix,
-        bvh__namespaced__stack == old_bvh__namespaced__stack + 1);
     ///// first draft done
     *bvh__namespaced_t = t_ix.t;
     bvh__return__ix = t_ix.ix - 1u;
@@ -563,8 +556,16 @@ spheresToFlatRep :: NonEmptyArray Sphere -> Array Number
 spheresToFlatRep arr = join $ toArray $ map (\(Sphere { cx, cy, cz, radius }) -> [ cx, cy, cz, radius ]) arr
 
 spheresToBVHNodes :: Int -> NonEmptyArray Sphere -> NonEmptyArray BVHNode
-spheresToBVHNodes seed arr = (evalGen (go [] (mapWithIndex Tuple arr)) { newSeed: mkSeed seed, size: 10 }).array
+spheresToBVHNodes seed arr = out
   where
+  out = mapWithIndex (\i (BVHNode x) -> BVHNode (x { parent = fromMaybe 0 $ Map.lookup i parMap })) initialRes
+  parMap =
+    Map.fromFoldable
+      $ join
+      $ mapWithIndex (\i (BVHNode { left, right, is_sphere }) -> if is_sphere == 1 then [] else [ Tuple left i, Tuple right i ])
+      $ toArray initialRes
+  initialRes = (evalGen (go [] (mapWithIndex Tuple arr)) { newSeed: mkSeed seed, size: 10 }).array
+
   go
     :: Array BVHNode
     -> NonEmptyArray (Tuple Int Sphere)
@@ -587,8 +588,8 @@ spheresToBVHNodes seed arr = (evalGen (go [] (mapWithIndex Tuple arr)) { newSeed
             , aabb_max_y: a.cy + a.radius
             , aabb_max_z: a.cz + a.radius
             , left: i
-            , right: 0
             , parent: 0
+            , right: 0
             , is_sphere: 1
             }
         pure
