@@ -1111,6 +1111,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: hitsBuffer } :: GPUBufferBinding)
           ]
       }
+    clearNodesBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: currentNodeBuffer } :: GPUBufferBinding)
+          ]
+      }
     hitsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: hitsBindGroupLayout
       , entries:
@@ -1136,6 +1143,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: rawColorBuffer } :: GPUBufferBinding)
           ]
       }
+    wBitmaskBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: currentBitmaskBuffer } :: GPUBufferBinding)
+          ]
+      }
     rColorsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: rBindGroupLayout
       , entries:
@@ -1149,6 +1163,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
+      }
+    resetHitsBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetHitsBufferStage
+      }
+    resetNodesBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetNodesBufferStage
       }
     zeroOutBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
@@ -1214,15 +1236,29 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        -- clear hits/spheres as they're subject to an atomic operation
-        GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
+
+
+        -- clear hits and spheres as they're subject to an atomic operation
+        GPUComputePassEncoder.setPipeline computePassEncoder resetHitsBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           clearHitsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        -- clear nodes as they're subject to an atomic operation
+        GPUComputePassEncoder.setPipeline computePassEncoder resetNodesBufferPipeline
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          clearNodesBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
         -- clear colors as they're subject to an atomic operation
+        GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
+        -- also clear bitmask, we can do this with the same pipeline
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wBitmaskBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
+
+
         ------------------------
         let
           work n = do
