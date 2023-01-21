@@ -255,7 +255,6 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   // bvh__namespaced__node_ix needed in array
 
   var bvh__namespaced__tmp_box: aabb;
-  var bvh__namespaced__stack = 0u;
 
   var my_id = (rendering_info.canvas_height * rendering_info.real_canvas_width) - 444u;
   var dbg_cond = select(false, true, dbg_id == my_id);
@@ -265,7 +264,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   loop {
     var t_ix: t_and_ix;
     u32_to_t_and_ix(bvh__namespaced__t_sphere, &t_ix);
-
+    var bvh__namespaced__stack = read_stack_at_bitmask(bvh__namespaced__bitmask);
     ///
     var sphere_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left * 4u;
     var sphere_hit = hit_sphere(
@@ -384,6 +383,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         false,
         obj_is_sphere
       ));
+    bvh__namespaced__bitmask = write_stack_at_bitmask(bvh__namespaced__bitmask, bvh__namespaced__stack);
     ///// first draft done
     *bvh__namespaced_t = t_ix.t;
     bvh__namespaced__t_sphere = t_and_ix_to_u32(&t_ix);
