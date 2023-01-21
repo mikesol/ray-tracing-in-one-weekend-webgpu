@@ -246,10 +246,8 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
 
-  // needed in array
   var bvh__namespaced__node_ix = current_node_array[idx];
   var bvh__namespaced__t_sphere = result_array[idx];
-  // needed in array
   var bvh__namespaced__bitmask = current_bitmask_array[idx];
   // bvh__namespaced__node_ix needed in array
 
@@ -391,6 +389,8 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
     if (stack_is_0 && loop_completed) { break; }
     //break; // debug for testing
   }
+  current_node_array[idx] = bvh__namespaced__node_ix;
+  current_bitmask_array[idx] = bvh__namespaced__bitmask;
   result_array[idx] = bvh__namespaced__t_sphere;
 """
   ]
