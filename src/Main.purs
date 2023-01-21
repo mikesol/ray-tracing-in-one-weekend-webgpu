@@ -19,7 +19,7 @@ import Data.Float32 (fromNumber')
 import Data.Float32 as F
 import Data.Function (on)
 import Data.FunctorWithIndex (mapWithIndex)
-import Data.Int (ceil, floor, pow, toNumber)
+import Data.Int (ceil, floor, toNumber)
 import Data.Int.Bits (complement, shl, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Map as Map
@@ -61,7 +61,7 @@ import Web.GPU.GPUBufferUsage as GPUBufferUsage
 import Web.GPU.GPUCanvasAlphaMode (opaque)
 import Web.GPU.GPUCanvasConfiguration (GPUCanvasConfiguration)
 import Web.GPU.GPUCanvasContext (configure, getCurrentTexture)
-import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToBuffer, copyBufferToTexture, finish)
+import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToTexture, finish)
 import Web.GPU.GPUComputePassEncoder as GPUComputePassEncoder
 import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule, limits)
 import Web.GPU.GPUDevice as GPUDevice
@@ -81,8 +81,11 @@ import Web.HTML.HTMLCanvasElement (height, setHeight, setWidth, toElement, width
 import Web.HTML.Window (navigator, requestAnimationFrame)
 import Web.Promise as Web.Promise
 
+testNSpheres :: Int
 testNSpheres = 512
+testAntiAliasMax :: Int
 testAntiAliasMax = 8
+testBounces :: Int
 testBounces = 32
 -- defs
 inputData :: String
