@@ -232,15 +232,13 @@ newtype HitBVHInfo = HitBVHInfo
   , nodesName :: String
   , rName :: String
   , spheresName :: String
-  , startNodeIx :: String
   , tMaxName :: String
   , tMinName :: String
   }
 
 hitBVHNode :: HitBVHInfo -> String
-hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, tMaxName, hitTName }) = intercalate "\n"
-  [ "  var bvh__namespaced__node_ix = " <> startNodeIx <> ";"
-  , "  let bvh__namespaced__nodes = &" <> nodesName <> ";"
+hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitTName }) = intercalate "\n"
+  ["  let bvh__namespaced__nodes = &" <> nodesName <> ";"
   , "  let bvh__namespaced__spheres = &" <> spheresName <> ";"
   , "  let bvh__namespaced__r = &" <> rName <> ";"
   , "  var bvh__namespaced__t_min = " <> tMinName <> ";"
@@ -249,9 +247,10 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   , """
 
   // needed in array
-  var bvh__namespaced__t_sphere = pack2x16float(vec2(0.0, 10000.f));
+  var bvh__namespaced__node_ix = current_node_array[idx];
+  var bvh__namespaced__t_sphere = result_array[idx];
   // needed in array
-  var bvh__namespaced__bitmask = 0u;
+  var bvh__namespaced__bitmask = current_bitmask_array[idx];
   // bvh__namespaced__node_ix needed in array
 
   var bvh__namespaced__tmp_box: aabb;
@@ -392,6 +391,7 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
     if (stack_is_0 && loop_completed) { break; }
     //break; // debug for testing
   }
+  result_array[idx] = bvh__namespaced__t_sphere;
 """
   ]
 
@@ -840,7 +840,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // assume that x is always w, y is always h
   // but z is variable
-  result_array[global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x] = rendering_info.n_spheres - 1; 
+  result_array[global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x] = rendering_info.n_bvh_nodes - 1; 
 }"""
               ]
         }
@@ -892,11 +892,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
   var hit_t: f32 = 0.42424242424242;
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
   """
             , hitBVHNode
                 ( HitBVHInfo
-                    { startNodeIx: "rendering_info.n_bvh_nodes - 1"
-                    , nodesName: "bvh_info"
+                    { nodesName: "bvh_info"
                     , spheresName: "sphere_info"
                     , rName: "r"
                     , tMinName: "0.0001"
@@ -905,8 +905,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                     }
                 )
             , """ 
-  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
-  result_array[idx] = bvh__namespaced__t_sphere;
 }"""
             ]
         }
