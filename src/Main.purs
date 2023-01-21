@@ -24,7 +24,7 @@ import Data.JSDate (getTime, now)
 import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype, unwrap)
 import Data.NonEmpty (NonEmpty(..))
-import Data.Traversable (sequence, sequence_, traverse)
+import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
 import Debug (spy)
@@ -212,6 +212,7 @@ struct bvh_node {
   aabb_max_z: f32,
   left: u32,
   right: u32,
+  parent: u32,
   is_sphere: u32
 }
 
@@ -247,11 +248,8 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
  // we make our stack 100-deep, which is more than enough for our purposes
   //var bvh__namespaced__on_left = array<bool, 100>();
   //var bvh__namespaced__on_right = array<bool, 100>();
+  var bvh__namespaced__t_sphere = pack2x16float(vec2(0.0, 10000.f));
   var bvh__namespaced__bitmask = 0u;
-  var bvh__namespaced__sphere_left = array<u32, 100>();
-  var bvh__namespaced__sphere_right = array<u32, 100>();
-  var bvh__namespaced__hit_t_left = array<f32, 100>();
-  var bvh__namespaced__hit_t_right = array<f32, 100>();
   var bvh__namespaced__parent_node = array<u32, 100>();
 
   var bvh__namespaced__tmp_box: aabb;
@@ -267,6 +265,9 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
   //////////////
   // as branching causes bugs in windows (and perhaps other platforms), we run this entirely on select statements
   loop {
+    var t_ix: t_and_ix;
+    u32_to_t_and_ix(bvh__namespaced__t_sphere, &t_ix);
+
     ///
     var sphere_ix = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left * 4u;
     var sphere_hit = hit_sphere(
@@ -289,86 +290,23 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
     var up_1_on_right = read_at_right(bvh__namespaced__bitmask, bvh__namespaced__stack - 1);
     var up_1_on_left = !up_1_on_right;
     ///
-    var min_t = select(
-      select(
-        select(bvh__namespaced__hit_t_right[bvh__namespaced__stack]
-          , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
-          , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < bvh__namespaced__hit_t_right[bvh__namespaced__stack])
-          , bvh__namespaced__hit_t_left[bvh__namespaced__stack]
-          , bvh__namespaced__hit_t_right[bvh__namespaced__stack] < 0.f
-          )
-        , bvh__namespaced__hit_t_right[bvh__namespaced__stack]
-        , bvh__namespaced__hit_t_left[bvh__namespaced__stack] < 0.f);
-    var winning_sphere = select(bvh__namespaced__sphere_left[bvh__namespaced__stack]
-        , bvh__namespaced__sphere_right[bvh__namespaced__stack]
-        , min_t == bvh__namespaced__hit_t_right[bvh__namespaced__stack]);
-    ///
     var i_plus_1 = ((*bvh__namespaced__nodes)[bvh__namespaced__node_ix]).left + 1u;
     ///////////////
     ///////////////
     ///////////////
     ///////////////
-    var old_hit_t_right_up_1 = bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1u];
-    bvh__namespaced__hit_t_right[bvh__namespaced__stack - 1u] =
+    var old_t = t_ix.t;
+    t_ix.t =
       select(
-        select(
-          select(
-            old_hit_t_right_up_1,
-            select(old_hit_t_right_up_1, min_t, up_1_on_right),
-            loop_completed
-          ),
-          select(old_hit_t_right_up_1, select(-1.f, old_hit_t_right_up_1, was_aabb_hit), up_1_on_right),
-          not_left
-        ),
-        select(old_hit_t_right_up_1, select(-1.f, *bvh__namespaced_t, sphere_hit), up_1_on_right),
+        t_ix.t,
+        select(t_ix.t, select(t_ix.t, *bvh__namespaced_t, *bvh__namespaced_t < t_ix.t), sphere_hit),
         obj_is_sphere
       );
     ///
-    var old_hit_t_left_up_1 = bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1u];
-    bvh__namespaced__hit_t_left[bvh__namespaced__stack - 1u] =
+    t_ix.ix =
       select(
-        select(
-          select(
-            old_hit_t_left_up_1,
-            select(old_hit_t_left_up_1, min_t, up_1_on_left),
-            loop_completed
-          ),
-          select(old_hit_t_left_up_1, select(-1.f, old_hit_t_left_up_1, was_aabb_hit), up_1_on_left),
-          not_left
-        ),
-        select(old_hit_t_left_up_1, select(-1.f, *bvh__namespaced_t, sphere_hit), up_1_on_left),
-        obj_is_sphere
-      );
-    /// first draft done
-    var old_sphere_right_up_1 = bvh__namespaced__sphere_right[bvh__namespaced__stack - 1u];
-    bvh__namespaced__sphere_right[bvh__namespaced__stack - 1u] =
-      select(
-        select(
-          select(
-            old_sphere_right_up_1,
-            select(old_sphere_right_up_1, winning_sphere, up_1_on_right),
-            loop_completed
-          ),
-          select(old_sphere_right_up_1, select(0, old_sphere_right_up_1, was_aabb_hit), up_1_on_right),
-          not_left
-        ),
-        select(old_sphere_right_up_1, select(0, i_plus_1, sphere_hit), up_1_on_right),
-        obj_is_sphere
-      );
-    /// first draft done
-    var old_sphere_left_up_1 = bvh__namespaced__sphere_left[bvh__namespaced__stack - 1u];
-    bvh__namespaced__sphere_left[bvh__namespaced__stack - 1u] =
-      select(
-        select(
-          select(
-            old_sphere_left_up_1,
-            select(old_sphere_left_up_1, winning_sphere, up_1_on_left),
-            loop_completed
-          ),
-          select(old_sphere_left_up_1, select(0, old_sphere_left_up_1, was_aabb_hit), up_1_on_left),
-          not_left
-        ),
-        select(old_sphere_left_up_1, select(0, i_plus_1, sphere_hit), up_1_on_left),
+        t_ix.ix,
+        select(t_ix.ix, select(t_ix.ix, i_plus_1, old_t != t_ix.t), sphere_hit),
         obj_is_sphere
       );
     /// first draft done
@@ -457,54 +395,10 @@ hitBVHNode (HitBVHInfo { startNodeIx, nodesName, spheresName, rName, tMinName, t
         old_bvh__namespaced__node_ix,
         bvh__namespaced__stack == old_bvh__namespaced__stack + 1);
     ///// first draft done
-    *bvh__namespaced_t =
-      select(
-        select(
-          select(
-            0.0, // won't be used so it doesn't matter
-            min_t,
-            loop_completed
-          ),
-          0.0, // won't be used so it doesn't matter
-          not_left
-        ),
-        select(-1.0, *bvh__namespaced_t, sphere_hit),
-        obj_is_sphere
-      );
-    /////// first draft done
-    bvh__return__hit =
-      select(
-        select(
-          select(
-            false, // won't be used
-            min_t > 0.f,
-            loop_completed
-          ),
-          false, // won't be used
-          not_left
-        ),
-        sphere_hit,
-        obj_is_sphere
-      );
-    /////// first draft done
-    bvh__return__ix =
-      select(
-        select(
-          select(
-            0, // not used
-            // below will be a garbage value when we're not at 0
-            // but when we are it's the correct value
-            select(bvh__namespaced__sphere_left[0u]
-                , bvh__namespaced__sphere_right[0u]
-                , min_t == bvh__namespaced__hit_t_right[0u]) - 1,
-            loop_completed
-          ),
-          0, // not used
-          not_left
-        ),
-        sphere_ix / 4,
-        obj_is_sphere
-      );
+    *bvh__namespaced_t = t_ix.t;
+    bvh__return__ix = t_ix.ix - 1u;
+    bvh__return__hit = t_ix.ix > 0u;
+    bvh__namespaced__t_sphere = t_and_ix_to_u32(&t_ix);
     if (stack_is_0 && obj_is_sphere) { break; }
     if (stack_is_0 && !was_aabb_hit) { break; }
     if (stack_is_0 && loop_completed) { break; }
@@ -643,6 +537,7 @@ type NodeBounds =
 newtype BVHNode = BVHNode
   { left :: Int
   , right :: Int
+  , parent :: Int
   , is_sphere :: Int
   | NodeBounds
   }
@@ -693,6 +588,7 @@ spheresToBVHNodes seed arr = (evalGen (go [] (mapWithIndex Tuple arr)) { newSeed
             , aabb_max_z: a.cz + a.radius
             , left: i
             , right: 0
+            , parent: 0
             , is_sphere: 1
             }
         pure
@@ -714,6 +610,7 @@ spheresToBVHNodes seed arr = (evalGen (go [] (mapWithIndex Tuple arr)) { newSeed
             ( sb `union`
                 { left: leftIndex
                 , right: rightIndex
+                , parent: 0
                 , is_sphere: 0
                 }
             )
@@ -794,10 +691,11 @@ bvhNodesToFloat32Array arr = do
         , aabb_max_z
         , left
         , right
+        , parent
         , is_sphere
         }
     ) = do
-    tl :: Uint32Array <- fromArray [ fromInt left, fromInt right, fromInt is_sphere ]
+    tl :: Uint32Array <- fromArray [ fromInt left, fromInt right, fromInt parent, fromInt is_sphere ]
     tlv :: Array F.Float32 <- (whole :: _ -> Effect Float32Array) (DV.buffer (DV.whole (Typed.buffer tl))) >>= Typed.toArray
     pure $
       [ fromNumber' aabb_min_x
@@ -850,7 +748,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 100 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
+    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
