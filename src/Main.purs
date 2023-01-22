@@ -1372,7 +1372,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               hitComputePipeline
             let
               workwork m = do
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 (max 4 (256 - m)) 16
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 (max 4 (nSpheres - (m * 8))) 16
             foreachE (1 .. nSpheres) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
