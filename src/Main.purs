@@ -26,6 +26,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Newtype (class Newtype, unwrap)
 import Data.NonEmpty (NonEmpty(..))
+import Data.Number (pow)
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
@@ -1267,6 +1268,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wBitmaskBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
+        let fwgg w m n p = ceil (((toNumber n / toNumber testBounces) `pow` p) * ((toNumber m / toNumber nSpheres) `pow` p) * toNumber w)
+        let fwgxl = fwgg workgroupX
+        let fwgyl = fwgg workgroupY
+        let fwg w n p = ceil (((toNumber n / toNumber testBounces) `pow` p) * toNumber w)
+        let fwgxb = fwg workgroupX  
+        let fwgyb = fwg workgroupY 
         ------------------------
         let
           work n = do
@@ -1278,8 +1285,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             let
               workwork mm = do
                 let m = mm
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder ((workgroupX / (n/2 * m/2 +1)) + 1) ((workgroupY / (n/2 * m/2 +1)) + 1) antiAliasPasses
-            foreachE (1 .. (nSpheres `shl` 1)) workwork
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (fwgxl m n 16.0) (fwgyl m n 16.0) antiAliasPasses
+            foreachE (1 .. nSpheres) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
@@ -1287,7 +1294,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               wColorsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder ((workgroupX / (n/2+1)) + 1) ((workgroupY / (n/2+1)) + 1) antiAliasPasses
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (fwgxb n 16.0) (fwgyb n 16.0) antiAliasPasses
         foreachE (1 .. testBounces) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
