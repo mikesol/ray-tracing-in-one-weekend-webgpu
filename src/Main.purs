@@ -85,7 +85,7 @@ import Web.Promise as Web.Promise
 testNSpheres :: Int
 testNSpheres = 512
 testAntiAliasMax :: Int
-testAntiAliasMax = 8
+testAntiAliasMax = 1
 testBounces :: Int
 testBounces = 32
 -- defs
@@ -403,6 +403,7 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
   current_node_array[idx] = bvh__namespaced__node_ix;
   current_bitmask_array[idx] = bvh__namespaced__bitmask;
   result_array[idx] = bvh__namespaced__t_sphere;
+  _ = atomicAdd(&workgroup_atomics[0], 1);
 """
   ]
 
@@ -788,6 +789,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
       }
+    xyzBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage
+      }
+    workgroupBuffer <- liftEffect $ createBuffer device $ x
+      { size: 32
+      , usage: GPUBufferUsage.storage
+      }
     wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
@@ -822,7 +831,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               [ inputData
               , """
 // main
-@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct; 
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
@@ -885,6 +894,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
 @group(1) @binding(1) var<storage, read_write> current_node_array : array<u32>;
 @group(1) @binding(2) var<storage, read_write> current_bitmask_array : array<u32>;
+@group(1) @binding(3) var<storage, read_write> xyz_array : array<u32>;
+@group(1) @binding(4) var<storage, read_write> workgroup_atomics : array<atomic<u32>>;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >  rendering_info.anti_alias_passes) {
@@ -1089,7 +1100,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     hitsBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
-              (0 .. 2) <#> \i ->
+              (0 .. 4) <#> \i ->
                 gpuBindGroupLayoutEntry i GPUShaderStage.compute
                   ( x { type: GPUBufferBindingType.storage }
                       :: GPUBufferBindingLayout
@@ -1138,6 +1149,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: currentNodeBuffer } :: GPUBufferBinding)
           , gpuBindGroupEntry 2
               (x { buffer: currentBitmaskBuffer } :: GPUBufferBinding)
+          , gpuBindGroupEntry 3
+              (x { buffer: xyzBuffer } :: GPUBufferBinding)
+          , gpuBindGroupEntry 4
+              (x { buffer: workgroupBuffer } :: GPUBufferBinding)
           ]
       }
     rHitsBindGroup <- liftEffect $ createBindGroup device $ x
@@ -1285,7 +1300,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             let
               workwork mm = do
                 let m = mm
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (fwgxl m n 16.0) (fwgyl m n 16.0) antiAliasPasses
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
             foreachE (1 .. nSpheres) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
@@ -1294,8 +1309,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               wColorsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (fwgxb n 16.0) (fwgyb n 16.0) antiAliasPasses
-        foreachE (1 .. testBounces) work
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+        foreachE (1 .. 1) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           rColorsBindGroup
