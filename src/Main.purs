@@ -62,7 +62,7 @@ import Web.GPU.GPUBufferUsage as GPUBufferUsage
 import Web.GPU.GPUCanvasAlphaMode (opaque)
 import Web.GPU.GPUCanvasConfiguration (GPUCanvasConfiguration)
 import Web.GPU.GPUCanvasContext (configure, getCurrentTexture)
-import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToTexture, finish)
+import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToBuffer, copyBufferToTexture, finish)
 import Web.GPU.GPUComputePassEncoder as GPUComputePassEncoder
 import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule, limits)
 import Web.GPU.GPUDevice as GPUDevice
@@ -85,7 +85,7 @@ import Web.Promise as Web.Promise
 testNSpheres :: Int
 testNSpheres = 512
 testAntiAliasMax :: Int
-testAntiAliasMax = 1
+testAntiAliasMax = 4
 testBounces :: Int
 testBounces = 32
 -- defs
@@ -173,6 +173,13 @@ fn t_and_ix_to_u32(p: ptr<function, t_and_ix>) -> u32 {
   return pack2x16float(vec2(f32((*p).ix)+0.1, (*p).t));
 }
   """
+
+workgroupStrides :: String
+workgroupStrides = """
+const stride_workgroup_y = 8u; 
+const stride_workgroup_z = 8u;
+const stride_workgroup_x = 64u; // from local workgroup, globally increments in 1
+"""
 
 aabb :: String
 aabb =
@@ -400,10 +407,11 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
     //break; // debug for testing
   // loopdebug
   /////////////////////////////}
-  current_node_array[ix] = bvh__namespaced__node_ix;
-  current_bitmask_array[ix] = bvh__namespaced__bitmask;
+  var fresh_ix = atomicAdd(&workgroup_info.current_ix, 1);
+  current_node_array[fresh_ix] = bvh__namespaced__node_ix;
+  current_bitmask_array[fresh_ix] = bvh__namespaced__bitmask;
+  xyz_array[fresh_ix] = write_z_at_bitmask(write_y_at_bitmask(write_x_at_bitmask(0u,x),y),z);
   result_array[idx] = bvh__namespaced__t_sphere;
-  _ = atomicAdd(&workgroup_atomics[0], 1);
 """
   ]
 
@@ -794,8 +802,12 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.storage
       }
     workgroupBuffer <- liftEffect $ createBuffer device $ x
-      { size: 32
-      , usage: GPUBufferUsage.storage
+      { size: (32 * nSpheres * 4) + 4
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.copySrc
+      }
+    workgroupBuffer2 <- liftEffect $ createBuffer device $ x
+      { size: (32 * nSpheres * 4) + 4
+      , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.indirect
       }
     wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
@@ -848,19 +860,43 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , entryPoint: "main"
         }
     let
+      resetWorkgroupsBufferDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct; 
+@group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  result_array[0] = 1u << 15; // x
+  result_array[1] = 8u; // y
+  result_array[2] = 8u; // z
+  result_array[3] = 0u; // cur max
+  result_array[4] = rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes; // prev max
+}"""
+              ]
+        }
+    resetWorkgroupsBufferModule <- liftEffect $ createShaderModule device resetWorkgroupsBufferDesc
+    let
+      (resetWorkgroupsBufferStage :: GPUProgrammableStage) = x
+        { "module": resetWorkgroupsBufferModule
+        , entryPoint: "main"
+        }
+    let
       resetNodesBufferDesc = x
         { code:
             intercalate "\n"
               [ inputData
+              , workgroupStrides
               , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  // assume that x is always w, y is always h
-  // but z is variable
-  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
   result_array[ix] = rendering_info.n_bvh_nodes - 1; 
 }"""
               ]
@@ -876,6 +912,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         { code:
             intercalate "\n"
               [ inputData
+              , workgroupStrides
               , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
@@ -884,7 +921,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // assume that x is always w, y is always h
   // but z is variable
-  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
   result_array[ix] = 0u; 
 }"""
               ]
@@ -896,11 +933,37 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , entryPoint: "main"
         }
     let
+      shiftWorkgroupDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(4) var<storage, read_write> result_array : array<u32>;
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  if (global_id.x > 0u || global_id.y > 0u || global_id.z > 0u) { return; }
+  var total_consumed = result_array[3];
+  result_array[4] = total_consumed;
+  result_array[3] = 0u;
+  result_array[1] = (total_consumed / (8u * 8u * 64u)) + 1;
+}"""
+              ]
+        }
+    shiftWorkgroupModule <- liftEffect $ createShaderModule device shiftWorkgroupDesc
+    let
+      (shiftWorkgroupStage :: GPUProgrammableStage) = x
+        { "module": shiftWorkgroupModule
+        , entryPoint: "main"
+        }
+    let
       resetXYZBufferDesc = x
         { code:
             intercalate "\n"
               [ inputData
               , readWriteAtLevel
+              , workgroupStrides
               , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
@@ -909,7 +972,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // assume that x is always w, y is always h
   // but z is variable
-  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
   var z = ix / cwch;
   var y = (ix / rendering_info.real_canvas_width) % rendering_info.canvas_height;
@@ -936,12 +999,22 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             , hitSphere
             , aabb
             , getTAndIx
+            , workgroupStrides
             , readWriteAtLevel
             , bvhNode
             , sphereBoundingBox
             , usefulConsts
             , """
 // main
+
+struct workgroup_info_struct {
+  x: u32,
+  y: u32,
+  z: u32,
+  current_ix: atomic<u32>,
+  prev_ix: u32
+};
+
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_info : array<bvh_node>;
@@ -949,10 +1022,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(1) @binding(1) var<storage, read_write> current_node_array : array<u32>;
 @group(1) @binding(2) var<storage, read_write> current_bitmask_array : array<u32>;
 @group(1) @binding(3) var<storage, read_write> xyz_array : array<u32>;
-@group(1) @binding(4) var<storage, read_write> workgroup_atomics : array<atomic<u32>>;
+@group(1) @binding(4) var<storage, read_write> workgroup_info : workgroup_info_struct;
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
+  if (ix >= workgroup_info.prev_ix) { return; }
   var z = read_z_at_bitmask(xyz_array[ix]);
   var y = read_y_at_bitmask(xyz_array[ix]);
   var x = read_x_at_bitmask(xyz_array[ix]);
@@ -1194,6 +1268,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: currentNodeBuffer } :: GPUBufferBinding)
           ]
       }
+    resetWorkgroupsBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: workgroupBuffer } :: GPUBufferBinding)
+          ]
+      }
     clearXYZBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
       , entries:
@@ -1271,6 +1352,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       { layout: readOPipelineLayout
       , compute: resetColorsBufferStage
       }
+    resetWorkgroupsPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetWorkgroupsBufferStage
+      }
+    workgroupComputePipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: hitsPipelineLayout -- todo: slim down if having this big is a problem
+      , compute: shiftWorkgroupStage
+      }
     hitComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: hitsPipelineLayout
       , compute: hitStage
@@ -1324,38 +1413,47 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , 0
           ]
         let asBuffer = buffer cinfo
+        let wgx = 1 `shl` 15
+        let wgy = 8
+        let wgz = 8
         whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 6) [ fromNumber' tn ]
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
         -- not necessary in the loop, but useful as a stress test for animating positions
-        computePassEncoder <- beginComputePass commandEncoder (x {})
+        startPassEncoder <- beginComputePass commandEncoder (x {label:"startPassEncoder"})
         -- set reader for all computations
-        GPUComputePassEncoder.setBindGroup computePassEncoder 0
+        GPUComputePassEncoder.setBindGroup startPassEncoder 0
           readerBindGroup
+        -- clear workgroups
+        GPUComputePassEncoder.setPipeline startPassEncoder resetWorkgroupsPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
+          resetWorkgroupsBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder 1 1 1 -- should be fine
         -- clear xyz
-        GPUComputePassEncoder.setPipeline computePassEncoder resetXYZBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        GPUComputePassEncoder.setPipeline startPassEncoder resetXYZBufferPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
           clearXYZBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder wgx wgy wgz
         -- clear hits and spheres as they're subject to an atomic operation
-        GPUComputePassEncoder.setPipeline computePassEncoder resetHitsBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        GPUComputePassEncoder.setPipeline startPassEncoder resetHitsBufferPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
           clearHitsBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder workgroupX workgroupY 1
         -- clear nodes as they're subject to an atomic operation
-        GPUComputePassEncoder.setPipeline computePassEncoder resetNodesBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        GPUComputePassEncoder.setPipeline startPassEncoder resetNodesBufferPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
           clearNodesBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder wgx wgy wgz
         -- also clear bitmask
-        GPUComputePassEncoder.setPipeline computePassEncoder resetBitmaskBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        GPUComputePassEncoder.setPipeline startPassEncoder resetBitmaskBufferPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
           wBitmaskBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder wgx wgy wgz
         -- clear colors as they're subject to an atomic operation
-        GPUComputePassEncoder.setPipeline computePassEncoder resetColorsBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        GPUComputePassEncoder.setPipeline startPassEncoder resetColorsBufferPipeline
+        GPUComputePassEncoder.setBindGroup startPassEncoder 1
           wColorsBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ startPassEncoder workgroupX workgroupY 3
+        GPUComputePassEncoder.end startPassEncoder
         let fwgg w m n p = ceil (((toNumber n / toNumber testBounces) `pow` p) * ((toNumber m / toNumber nSpheres) `pow` p) * toNumber w)
         let fwgxl = fwgg workgroupX
         let fwgyl = fwgg workgroupY
@@ -1366,34 +1464,47 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         let
           work n = do
             -- get hits
-            GPUComputePassEncoder.setBindGroup computePassEncoder 1
-              hitsBindGroup
-            GPUComputePassEncoder.setPipeline computePassEncoder
-              hitComputePipeline
             let
               workwork m = do
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 (1024 / (m * 8) + 1) 16
+                copyBufferToBuffer commandEncoder workgroupBuffer 0 workgroupBuffer2 0 64
+                midPassEncoder <- beginComputePass commandEncoder (x {label:("midPassEncoder" <> show m)})
+                GPUComputePassEncoder.setBindGroup midPassEncoder 0
+                  readerBindGroup
+                GPUComputePassEncoder.setBindGroup midPassEncoder 1
+                  hitsBindGroup
+                GPUComputePassEncoder.setPipeline midPassEncoder
+                  hitComputePipeline
+                GPUComputePassEncoder.dispatchWorkgroupsIndirect midPassEncoder workgroupBuffer2 0 
+                GPUComputePassEncoder.setPipeline midPassEncoder
+                  workgroupComputePipeline
+                GPUComputePassEncoder.dispatchWorkgroupsX midPassEncoder 1
+                GPUComputePassEncoder.end midPassEncoder
             foreachE (1 .. nSpheres) workwork
             -- colorFill
-            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+            innerPassEncoder <- beginComputePass commandEncoder (x {label:("innerPassEncoder" <> show n)})
+            GPUComputePassEncoder.setBindGroup innerPassEncoder 0
+              readerBindGroup
+            GPUComputePassEncoder.setBindGroup innerPassEncoder 1
               rHitsBindGroup
-            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+            GPUComputePassEncoder.setBindGroup innerPassEncoder 2
               wColorsBindGroup
-            GPUComputePassEncoder.setPipeline computePassEncoder
+            GPUComputePassEncoder.setPipeline innerPassEncoder
               colorFillComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ innerPassEncoder workgroupX workgroupY antiAliasPasses
+            GPUComputePassEncoder.end innerPassEncoder
         foreachE (1 .. 7) work
         -- antiAlias
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+        lastPassEncoder <- beginComputePass commandEncoder (x {label:("endPassEncoder")})
+        GPUComputePassEncoder.setBindGroup lastPassEncoder 0
+          readerBindGroup
+        GPUComputePassEncoder.setBindGroup lastPassEncoder 1
           rColorsBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
+        GPUComputePassEncoder.setBindGroup lastPassEncoder 2
           wCanvasBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
+        GPUComputePassEncoder.setPipeline lastPassEncoder
           antiAliasComputePipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
-
-        --
-        GPUComputePassEncoder.end computePassEncoder
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ lastPassEncoder workgroupX workgroupY 1
+        GPUComputePassEncoder.end lastPassEncoder
         copyBufferToTexture
           commandEncoder
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
