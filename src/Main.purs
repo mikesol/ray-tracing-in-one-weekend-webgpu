@@ -1278,7 +1278,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             let
               workwork mm = do
                 let m = mm
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / (n * m)) (workgroupY / (n * m)) antiAliasPasses
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder ((workgroupX / (n/2 * m/2 +1)) + 1) ((workgroupY / (n/2 * m/2 +1)) + 1) antiAliasPasses
             foreachE (1 .. (nSpheres `shl` 1)) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
@@ -1287,7 +1287,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               wColorsBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder
               colorFillComputePipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / n) (workgroupY / n) antiAliasPasses
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder ((workgroupX / (n/2+1)) + 1) ((workgroupY / (n/2+1)) + 1) antiAliasPasses
         foreachE (1 .. testBounces) work
         -- antiAlias
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
