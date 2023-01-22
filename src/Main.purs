@@ -7,7 +7,7 @@ import Control.Lazy (fix)
 import Control.Monad.Gen (elements)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (intercalate, length, replicate, (..))
+import Data.Array (intercalate, length, replicate, (!!), (..))
 import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, snoc, snoc', sortBy, take, toArray, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
@@ -253,15 +253,15 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
   , "  let bvh__namespaced_t = &" <> hitTName <> ";"
   , """
 
-  var bvh__namespaced__node_ix = current_node_array[idx] & 0x7fffffff;
+  var bvh__namespaced__node_ix = current_node_array[ix] & 0x7fffffff;
   var bvh__namespaced__t_sphere = result_array[idx];
-  var bvh__namespaced__bitmask = current_bitmask_array[idx];
+  var bvh__namespaced__bitmask = current_bitmask_array[ix];
   // bvh__namespaced__node_ix needed in array
 
   var bvh__namespaced__tmp_box: aabb;
 
   //////////////
-  // as branching causes bugs in windows (and perhaps other platforms), we run this entirely on select statements
+  // as branching causes bugs in windows (and perhaps other platforms),  we run this entirely on select statements
   // loopdebug
   ///////////////////////loop {
     var t_ix: t_and_ix;
@@ -400,8 +400,8 @@ hitBVHNode (HitBVHInfo { nodesName, spheresName, rName, tMinName, tMaxName, hitT
     //break; // debug for testing
   // loopdebug
   /////////////////////////////}
-  current_node_array[idx] = bvh__namespaced__node_ix;
-  current_bitmask_array[idx] = bvh__namespaced__bitmask;
+  current_node_array[ix] = bvh__namespaced__node_ix;
+  current_bitmask_array[ix] = bvh__namespaced__bitmask;
   result_array[idx] = bvh__namespaced__t_sphere;
   _ = atomicAdd(&workgroup_atomics[0], 1);
 """
@@ -802,7 +802,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
       }
     let
-      zeroOutBufferDesc = x
+      resetColorsBufferDesc = x
         { code:
             intercalate "\n"
               [ inputData
@@ -818,10 +818,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 }"""
               ]
         }
-    zeroOutBufferModule <- liftEffect $ createShaderModule device zeroOutBufferDesc
+    resetColorsBufferModule <- liftEffect $ createShaderModule device resetColorsBufferDesc
     let
-      (zeroOutBufferStage :: GPUProgrammableStage) = x
-        { "module": zeroOutBufferModule
+      (resetColorsBufferStage :: GPUProgrammableStage) = x
+        { "module": resetColorsBufferModule
         , entryPoint: "main"
         }
     let
@@ -856,11 +856,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   // assume that x is always w, y is always h
   // but z is variable
-  result_array[global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x] = rendering_info.n_bvh_nodes - 1; 
+  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  result_array[ix] = rendering_info.n_bvh_nodes - 1; 
 }"""
               ]
         }
@@ -868,6 +869,59 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let
       (resetNodesBufferStage :: GPUProgrammableStage) = x
         { "module": resetNodesBufferModule
+        , entryPoint: "main"
+        }
+    let
+      resetBitmaskBufferDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  // assume that x is always w, y is always h
+  // but z is variable
+  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  result_array[ix] = 0u; 
+}"""
+              ]
+        }
+    resetBitmaskBufferModule <- liftEffect $ createShaderModule device resetBitmaskBufferDesc
+    let
+      (resetBitmaskBufferStage :: GPUProgrammableStage) = x
+        { "module": resetBitmaskBufferModule
+        , entryPoint: "main"
+        }
+    let
+      resetXYZBufferDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , readWriteAtLevel
+              , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  // assume that x is always w, y is always h
+  // but z is variable
+  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
+  var z = ix / cwch;
+  var y = (ix / rendering_info.real_canvas_width) % rendering_info.canvas_height;
+  var x = ix % rendering_info.real_canvas_width;
+  result_array[ix] = write_z_at_bitmask(write_y_at_bitmask(write_x_at_bitmask(0u, x), y), z);
+}"""
+              ]
+        }
+    resetXYZBufferModule <- liftEffect $ createShaderModule device resetXYZBufferDesc
+    let
+      (resetXYZBufferStage :: GPUProgrammableStage) = x
+        { "module": resetXYZBufferModule
         , entryPoint: "main"
         }
     let
@@ -896,23 +950,23 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(1) @binding(2) var<storage, read_write> current_bitmask_array : array<u32>;
 @group(1) @binding(3) var<storage, read_write> xyz_array : array<u32>;
 @group(1) @binding(4) var<storage, read_write> workgroup_atomics : array<atomic<u32>>;
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height || global_id.z >  rendering_info.anti_alias_passes) {
-    return;
-  }
+  var ix = (global_id.z * 2048 * 1024) + (global_id.y * 2048) + (global_id.x);
+  var z = read_z_at_bitmask(xyz_array[ix]);
+  var y = read_y_at_bitmask(xyz_array[ix]);
+  var x = read_x_at_bitmask(xyz_array[ix]);
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
-  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x) + (cwch * global_id.z);
-  var is_done = current_node_array[idx] & 0x80000000;
+  var idx = (y * rendering_info.real_canvas_width + x) + (cwch * z);
+  var is_done = current_node_array[ix] & 0x80000000;
   if (is_done > 0u) { return; }
-  var dbg_id = global_id.y * rendering_info.real_canvas_width + global_id.x;
   var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
   var ambitus_y = select(2.0 * aspect, 2.0, aspect >= 1.0);
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
-  var alias_pass = global_id.z;
-  var p_x = fuzz2(global_id.x, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
-  var p_y = 1. - fuzz2(global_id.y, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
+  var alias_pass = z;
+  var p_x = fuzz2(x, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.real_canvas_width);
+  var p_y = 1. - fuzz2(y, alias_pass, rendering_info.anti_alias_passes) / f32(rendering_info.canvas_height);
   var r: ray;
   r.origin = origin;
   r.direction = lower_left_corner + vec3(p_x * ambitus_x, p_y * ambitus_y, 0.0);
@@ -1140,6 +1194,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: currentNodeBuffer } :: GPUBufferBinding)
           ]
       }
+    clearXYZBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: xyzBuffer } :: GPUBufferBinding)
+          ]
+      }
     hitsBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: hitsBindGroupLayout
       , entries:
@@ -1198,9 +1259,17 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       { layout: readOPipelineLayout
       , compute: resetNodesBufferStage
       }
-    zeroOutBufferPipeline <- liftEffect $ createComputePipeline device $ x
+    resetBitmaskBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
-      , compute: zeroOutBufferStage
+      , compute: resetBitmaskBufferStage
+      }
+    resetXYZBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetXYZBufferStage
+      }
+    resetColorsBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetColorsBufferStage
       }
     hitComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: hitsPipelineLayout
@@ -1262,8 +1331,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-
-
+        -- clear xyz
+        GPUComputePassEncoder.setPipeline computePassEncoder resetXYZBufferPipeline
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          clearXYZBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
         -- clear hits and spheres as they're subject to an atomic operation
         GPUComputePassEncoder.setPipeline computePassEncoder resetHitsBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
@@ -1273,15 +1345,16 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setPipeline computePassEncoder resetNodesBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           clearNodesBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
-        -- clear colors as they're subject to an atomic operation
-        GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wColorsBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
-        -- also clear bitmask, we can do this with the same pipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
+        -- also clear bitmask
+        GPUComputePassEncoder.setPipeline computePassEncoder resetBitmaskBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wBitmaskBindGroup
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 1024 16
+        -- clear colors as they're subject to an atomic operation
+        GPUComputePassEncoder.setPipeline computePassEncoder resetColorsBufferPipeline
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wColorsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 3
         let fwgg w m n p = ceil (((toNumber n / toNumber testBounces) `pow` p) * ((toNumber m / toNumber nSpheres) `pow` p) * toNumber w)
         let fwgxl = fwgg workgroupX
@@ -1298,9 +1371,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             GPUComputePassEncoder.setPipeline computePassEncoder
               hitComputePipeline
             let
-              workwork mm = do
-                let m = mm
-                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY antiAliasPasses
+              workwork m = do
+                GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 32 (max 4 (256 - m)) 16
             foreachE (1 .. nSpheres) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
