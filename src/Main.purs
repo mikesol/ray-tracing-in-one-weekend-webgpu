@@ -723,7 +723,7 @@ bvhNodesToFloat32Array arr = do
       ] <> tlv
 
 gpuMe :: Effect Unit -> (FrameInfo -> Effect Unit) -> HTMLCanvasElement -> Effect Unit
-gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 20.0) *> liftEffect do
+gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 250.0) *> liftEffect do
   context <- getContext canvas >>= maybe
     (showErrorMessage *> throwError (error "could not find context"))
     pure
@@ -870,7 +870,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
 @compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  result_array[0] = 1u << 2; // 1u << 15; // x // should be 15, using 2 for testing
+  result_array[0] = 1u << 12; // increase to 13 if needed
   result_array[1] = 8u; // y
   result_array[2] = 8u; // z
   result_array[3] = 0u; // cur max
@@ -948,10 +948,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var total_consumed = result_array[3];
   result_array[4] = total_consumed;
   result_array[3] = 0u;
-  result_array[0] = 1 << 2; // (total_consumed / (8u * 8u * 64u)) + 1;
+  result_array[0] = (total_consumed / (8u * 8u * 64u)) + 1u;
   result_array2[4] = total_consumed;
   result_array2[3] = 0u;
-  result_array2[0] = 1 << 2; // (total_consumed / (8u * 8u * 64u)) + 1;
+  result_array2[0] = (total_consumed / (8u * 8u * 64u)) + 1u;
 }"""
               ]
         }
@@ -1029,12 +1029,13 @@ struct workgroup_info_struct {
 @group(1) @binding(4) var<storage, read_write> workgroup_info : workgroup_info_struct;
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
+  var max_passes = cwch * rendering_info.anti_alias_passes;
   var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
-  if (ix >= workgroup_info.prev_ix) { return; }
+  if (ix >= workgroup_info.prev_ix || ix < max_passes) { return; }
   var z = read_z_at_bitmask(xyz_array[ix]);
   var y = read_y_at_bitmask(xyz_array[ix]);
   var x = read_x_at_bitmask(xyz_array[ix]);
-  var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
   var idx = (y * rendering_info.real_canvas_width + x) + (cwch * z);
   var is_done = current_node_array[ix] & 0x80000000;
   if (is_done > 0u) { return; }
@@ -1444,7 +1445,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , 0
           ]
         let asBuffer = buffer cinfo
-        let wgx = 1 `shl` 15
+        let wgx = 1 `shl` 12
         let wgy = 8
         let wgz = 8
         whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 6) [ fromNumber' tn ]
@@ -1503,13 +1504,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                   hitsBindGroup
                 GPUComputePassEncoder.setPipeline computePassEncoder
                   hitComputePipeline
-                -- GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder workgroupBuffer2 0 
-                -- GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                --   workgroupBindGroup
-                -- GPUComputePassEncoder.setPipeline computePassEncoder
-                --   workgroupComputePipeline
-                -- GPUComputePassEncoder.dispatchWorkgroupsX computePassEncoder 1
-            foreachE (1 .. 120) workwork
+                GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder workgroupBuffer2 0 
+                --GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 120 4 4-- workgroupBuffer2 0 
+                GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                  workgroupBindGroup
+                GPUComputePassEncoder.setPipeline computePassEncoder
+                  workgroupComputePipeline
+                GPUComputePassEncoder.dispatchWorkgroupsX computePassEncoder 1
+            foreachE (1 .. 160) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
