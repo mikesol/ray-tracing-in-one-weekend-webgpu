@@ -1032,7 +1032,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
   var max_passes = cwch * rendering_info.anti_alias_passes;
   var ix = (global_id.z) + (global_id.y * stride_workgroup_z) + (global_id.x * stride_workgroup_y * stride_workgroup_z);
-  if (ix >= workgroup_info.prev_ix || ix < max_passes) { return; }
+  if (ix >= workgroup_info.prev_ix || ix >= max_passes) { return; }
   var z = read_z_at_bitmask(xyz_array[ix]);
   var y = read_y_at_bitmask(xyz_array[ix]);
   var x = read_x_at_bitmask(xyz_array[ix]);
