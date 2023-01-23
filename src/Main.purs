@@ -522,8 +522,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           dasUbershaderBindGroup
-        foreachE (1 .. ((16 * 64))) \m -> do
-          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (workgroupX / m + 1) (workgroupY / m + 1) 8
+        let n = (16 * 64)
+        foreachE (1 .. n) \m -> do
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (ceil (toNumber workgroupX * toNumber (m/n) + toNumber 1)) (ceil (toNumber workgroupY * toNumber (m/n) + toNumber 1)) 8
         --
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
