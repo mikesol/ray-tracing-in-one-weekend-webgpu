@@ -483,7 +483,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       m.y = cos(f32(m.y))*0.5+0.5;
       m.z = sin(f32(m.z))*0.5+0.5;    
   }
-  result_array[ix] = pack4x8unorm(m);
+  var z = atomicAdd(&workgroup_limits.c, 1);
+  result_array[ix] = pack4x8unorm(sin(m*f32(z))*0.5+0.5);
 }"""
               ]
         }
@@ -655,7 +656,7 @@ main = do
           []
       , D.div
           Alt.do
-            klass_ "absolute p-3 text-slate-400"
+            klass_ "absolute p-3 text-slate-900"
           [ errorMessage.event $> false <|> pure true <#~>
               if _ then
                 text (_.avgTime >>> show >>> ("Avg time: " <> _) <$> frameInfo.event)
