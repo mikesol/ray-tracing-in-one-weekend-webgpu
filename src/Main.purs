@@ -84,10 +84,13 @@ import Web.Promise as Web.Promise
 
 testNSpheres :: Int
 testNSpheres = 512
+
 testAntiAliasMax :: Int
 testAntiAliasMax = 4
+
 testBounces :: Int
 testBounces = 32
+
 -- defs
 inputData :: String
 inputData =
@@ -101,6 +104,13 @@ struct rendering_info_struct {
   n_bvh_nodes: u32, // number of bvh_nodes
   anti_alias_passes: u32, // number of spheres
   current_time: f32 // current time in seconds
+}
+
+struct position_info {
+  x: u32,
+  y: u32,
+  z: u32,
+  c: atomic<u32>
 }
 """
 
@@ -130,6 +140,31 @@ type Sphere' =
   , cz :: Number
   , radius :: Number
   }
+
+newtype XYZ = XYZ { x :: Int, y :: Int, z :: Int }
+derive newtype instance Show XYZ
+interpolateXYZOverRange :: (Number -> Number) -> Int -> XYZ -> Array XYZ
+interpolateXYZOverRange f i (XYZ { x, y, z }) = (0 .. (i - 1)) <#> \j ->
+  let
+    m = f ((toNumber j) / (toNumber i))
+  in
+    XYZ
+      { x: ceil (toNumber x * m)
+      , y: ceil (toNumber y * m)
+      , z: ceil (toNumber z * m)
+      }
+
+interpolate :: Number -> Number -> Number -> Number -> Number -> Number
+interpolate x0 y0 x1 y1 x =
+  let
+    m = (y1 - y0) / (x1 - x0)
+  in
+    y0 + m * (x - x0)
+
+keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth :: Number -> Number
+keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth x =
+  if x < 0.1 then 1.0
+  else interpolate 0.1 1.0 1.0 0.125 x
 
 newtype Sphere = Sphere Sphere'
 
@@ -322,13 +357,21 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         Just device -> pure device
     queue <- liftEffect $ GPUDevice.queue device
     deviceLimits <- liftEffect $ limits device
+    --------------------------
+    -- range
+    let
+      xyzs =
+        interpolateXYZOverRange keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth (8 * 16) (XYZ { x: 64, y: 32, z: 32 })
+    positions :: Uint32Array <- liftEffect $ fromArray $ join $ (map (\(XYZ { x, y, z }) -> [ fromInt x, 
+    fromInt y, fromInt z ] <> map fromInt (replicate 61 0)) xyzs)
+    positionBuffer <- liftEffect $ createBufferF device positions GPUBufferUsage.storage
     canvasInfoBuffer <- liftEffect $ createBuffer device $ x
       { size: 28 -- align(4) size(28)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
     bvhNodeBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.storage 
+      , usage: GPUBufferUsage.storage
       }
     sphereBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
@@ -344,14 +387,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
-    logShow bvhNodes
-    logShow spheres
+    --logShow bvhNodes
+    --logShow spheres
     bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
     let nSpheres = NEA.length spheres
     let nBVHNodes = NEA.length bvhNodes
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
-    dasUbershaderBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+    workgroupManagementBuffer <- liftEffect $ createBuffer device $ x
+      { size: 1 `shl` 15
       , usage: GPUBufferUsage.storage
       }
     wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
@@ -367,9 +410,13 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var ix = global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x;
+  if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
+    return;
+  }
   var m = vec4(sin(f32(global_id.x))*0.5+0.5,0.0,0.0,1.0);
   m.y = sin(f32(global_id.y))*0.5+0.5;
   m.z = cos(f32(global_id.z))*0.5+0.5;
@@ -478,7 +525,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           }
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ] }
     readerBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: readerBindGroupLayout
       , entries:
@@ -497,6 +544,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
       }
+    let
+      makePositionBindGroup offset = createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: wholeCanvasBuffer, offset } :: GPUBufferBinding)
+            ]
+        }
     dasUbershaderPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: dasUbershaderStage
@@ -511,6 +566,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     liftEffect $ configure context config
     loopN <- liftEffect $ Ref.new 0
+    logShow xyzs
     let maxStorageBufferBindingSize = deviceLimits.maxStorageBufferBindingSize
     let
       encodeCommands colorTexture = do
@@ -523,7 +579,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
-        let antiAliasPasses =  testAntiAliasMax -- min testAntiAliasMax $ ceil (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
+        let antiAliasPasses = testAntiAliasMax -- min testAntiAliasMax $ ceil (toNumber maxStorageBufferBindingSize / (toNumber (canvasWidth * canvasHeight * nSpheres * 4)))
         -- logShow antiAliasPasses
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         cf <- Ref.read currentFrame
@@ -555,9 +611,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           dasUbershaderBindGroup
-        let n = (16 * 64)
-        foreachE (1 .. n) \m -> do
-          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder (ceil (toNumber workgroupX * toNumber (m/n) + toNumber 1)) (ceil (toNumber workgroupY * toNumber (m/n) + toNumber 1)) 8
+        foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x,y,z})) -> do
+          GPUComputePassEncoder.setBindGroup computePassEncoder 2
+            =<< makePositionBindGroup (i * 256)
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder x y z
         --
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
@@ -570,7 +627,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         tnz <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
         pure unit
         launchAff_ do
-          toAffE $ convertPromise <$>  onSubmittedWorkDone queue
+          toAffE $ convertPromise <$> onSubmittedWorkDone queue
           liftEffect do
             tnx <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
             cfx <- Ref.read currentFrame
