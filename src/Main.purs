@@ -488,7 +488,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           dasUbershaderBindGroup
-        foreachE (1 .. (32 * 64)) \_ -> do
+        foreachE (1 .. ((32 * 64) / 50)) \_ -> do
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 16
         --
         GPUComputePassEncoder.end computePassEncoder
