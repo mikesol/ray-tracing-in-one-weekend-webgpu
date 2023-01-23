@@ -727,8 +727,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
   context <- getContext canvas >>= maybe
     (showErrorMessage *> throwError (error "could not find context"))
     pure
-  timeDeltaAverager <- averager
-  frameDeltaAverager <- averager
+  -- timeDeltaAverager <- averager
+  -- frameDeltaAverager <- averager
   startsAt <- getTime <$> now
   currentFrame <- Ref.new 0
   entry <- window >>= navigator >>= gpu >>= case _ of
@@ -1511,7 +1511,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                 GPUComputePassEncoder.setPipeline computePassEncoder
                   workgroupComputePipeline
                 GPUComputePassEncoder.dispatchWorkgroupsX computePassEncoder 1
-            foreachE (1 .. 160) workwork
+            foreachE (1 .. 256) workwork
             -- colorFill
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
               rHitsBindGroup
@@ -1541,20 +1541,21 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
         tnz <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
-        let debugCondition = false -- whichLoop == 100
-        launchAff_ do
-          toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
-          liftEffect do
-            when debugCondition do
-              bfr <- getMappedRange debugOutputBuffer
-              buffy <- (Typed.whole bfr :: Effect Uint32Array) >>= Typed.toArray
-              let _ = spy "buffy" buffy
-              unmap debugOutputBuffer
-            tnx <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
-            cfx <- Ref.read currentFrame
-            avgTime <- timeDeltaAverager (tnx - tn)
-            avgFrame <- frameDeltaAverager (toNumber (cfx - cf))
-            pushFrameInfo { avgTime, avgFrame }
+        pure unit
+        -- let debugCondition = false -- whichLoop == 100
+        -- launchAff_ do
+        --   toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
+        --   liftEffect do
+        --     when debugCondition do
+        --       bfr <- getMappedRange debugOutputBuffer
+        --       buffy <- (Typed.whole bfr :: Effect Uint32Array) >>= Typed.toArray
+        --       let _ = spy "buffy" buffy
+        --       unmap debugOutputBuffer
+        --     tnx <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
+        --     cfx <- Ref.read currentFrame
+        --     avgTime <- timeDeltaAverager (tnx - tn)
+        --     avgFrame <- frameDeltaAverager (toNumber (cfx - cf))
+        --     pushFrameInfo { avgTime, avgFrame }
     let
       render = unit # fix \f _ -> do
         colorTexture <- getCurrentTexture context
