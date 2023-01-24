@@ -379,6 +379,44 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       }
   pure shaderStage
 
+makeAntiAliasStage :: GPUDevice -> Effect GPUProgrammableStage
+makeAntiAliasStage device = do
+    let
+      shaderDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> rg_array : array<rg>;
+@group(1) @binding(1) var<storage, read_write> bmeta_array : array<bmeta>;
+@group(2) @binding(0) var<storage, read_write> result_array : array<f32>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height) {
+    return;
+  }
+  var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x);
+  var overshot_idx = global_id.x + (global_id.y * rendering_info.overshot_canvas_width);
+  var rgb = vec3<f32>(0.f, 0.f, 0.f);
+  var anti_alias_passes = f32(rendering_info.anti_alias_passes);
+  for (var i: i32 = 0; i < rendering_info.anti_alias_passes; i++) {
+    rgb += vec3(rg_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].r, rg_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].g, bmeta_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].b) / anti_alias_passes;
+  }
+  result_array[overshot_idx] = pack4x8unorm(rgb.b, rgb.g, rgb.r, 1.f);
+}
+"""
+              ]
+        }
+    shaderModule <- liftEffect $ createShaderModule device shaderDesc
+    let
+      (shaderStage :: GPUProgrammableStage) = x
+        { "module": shaderModule
+        , entryPoint: "main"
+        }
+    pure shaderStage
+
 makeUbershaderStage :: GPUDevice -> Effect GPUProgrammableStage
 makeUbershaderStage device = do
   let
@@ -594,6 +632,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       }
     dasUbershaderStage <- liftEffect $ makeUbershaderStage device
     rgbmetaxyzShaderStage <- liftEffect $ makeRGBMetaXYZShaderStage device
+    antiAliasStage <- liftEffect $ makeAntiAliasStage device
     readerBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
@@ -640,6 +679,10 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ]
 
+      , label: "readOPipelineLayout"
+      }
+    antiAliasPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout, wBindGroupLayout ]
       , label: "readOPipelineLayout"
       }
     initializeStuffPipelineLayout <- liftEffect $ createPipelineLayout device $ x
@@ -698,6 +741,11 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { layout: readOPipelineLayout
       , compute: dasUbershaderStage
       , label: "dasUbershaderPipeline"
+      }
+    antiAliasPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: antiAliasPipelineLayout
+      , compute: antiAliasStage
+      , label: "antiAliasPipeline"
       }
     let
       (config :: GPUCanvasConfiguration) = x
