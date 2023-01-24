@@ -580,24 +580,6 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: maxCanvasWidth * maxCanvasHeight * maxAntiAlias * 4
       , usage: GPUBufferUsage.storage .|. GPUBufferUsage.copyDst
       }
-    rgStashBuffer2 <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.copySrc
-      }
-    -- metadata is 32 bytes
-    -- first 16 bytes is the index of the bvh
-    -- next 8 bytes is the level of the bvh
-    -- next byte is whether it's a bvh or multiply
-    -- next byte is whether we're done
-    -- (26 total)
-    bMetadataStashBuffer2 <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.copySrc
-      }
-    xyzStashBuffer2 <- liftEffect $ createBuffer device $ x
-      { size: maxCanvasWidth * maxCanvasHeight * maxAntiAlias * 4
-      , usage: GPUBufferUsage.copySrc
-      }
     bvhNodeBuffer <- liftEffect $ createBuffer device $ x
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
@@ -715,13 +697,13 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           ]
       , label: "initializeStuffBindGroup"
       }
-    dasUbershaderBindGroup <- liftEffect $ createBindGroup device $ x
+    wholeCanvasBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
-      , label: "dasUbershaderBindGroup"
+      , label: "wholeCanvasBindGroup"
       }
     let
       makePositionBindGroup offset = createBindGroup device $ x
@@ -808,13 +790,13 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
         --------------------
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          dasUbershaderBindGroup
         foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x, y, z })) -> do
           GPUComputePassEncoder.setBindGroup computePassEncoder 2
             =<< makePositionBindGroup (i * 256)
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder x y z
         --
+        GPUComputePassEncoder.setBindGroup computePassEncoder 2
+          wholeCanvasBindGroup
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
           commandEncoder
