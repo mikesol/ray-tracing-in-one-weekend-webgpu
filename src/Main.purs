@@ -407,9 +407,13 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             intercalate "\n"
               [ inputData
               , """
+struct foo_bar {
+  foo: u32,
+  bar: u32
+}
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@group(1) @binding(0) var<storage, read_write> result_array : array<foo_bar>;
 @group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
@@ -417,7 +421,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
     return;
   }
-  var m = vec4(sin(f32(global_id.x))*0.5+0.5,0.0,0.0,1.0);
+  var y = result_array[ix];
+  var m = unpack4x8unorm(y.foo);
+  var n = unpack4x8unorm(y.bar);
+  m += n;
   m.y = sin(f32(global_id.y))*0.5+0.5;
   m.z = cos(f32(global_id.z))*0.5+0.5;
   if (global_id.x % 2u == 0u) {
@@ -483,7 +490,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       m.y = cos(f32(m.y))*0.5+0.5;
       m.z = sin(f32(m.z))*0.5+0.5;    
   }
-  result_array[ix] = pack4x8unorm(m);
+  var fb: foo_bar;
+  fb.foo = pack4x8unorm(m);
+  fb.bar = pack4x8unorm(m)*2u;
+  result_array[ix] = fb;
 }"""
               ]
         }
