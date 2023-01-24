@@ -461,7 +461,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   bmeta_array[idx].b = 0.5f;
   var fresh_ix = atomicAdd(&workgroup_limits.c, 1);
   xyz_array[fresh_ix] = (z << 28) | (y << 14) | x;
-  //xyz_array[idx] = (z << 28) | (y << 14) | x;
 }"""
             ]
       }
