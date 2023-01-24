@@ -127,6 +127,19 @@ struct bmeta {
 }
 """
 
+readBitmask :: String
+readBitmask = """
+fn read_x_at_bitmask(xyz: u32) -> u32 {
+  return xyz & 0x3fff; // range [0,14)
+}
+fn read_y_at_bitmask(xyz: u32) -> u32 {
+  return (xyz >> 14u) & 0x3fff; // range [14,28)
+}
+fn read_z_at_bitmask(xyz: u32) -> u32 {
+  return xyz >> 28u; // range [28,32)
+}
+"""
+
 type NodeBounds =
   ( aabb_min_x :: Number
   , aabb_min_y :: Number
@@ -367,7 +380,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   rg_array[idx].g = 1.f;
   bmeta_array[idx].b = 1.f;
   bmeta_array[idx].m = 0u;
-  xyz_array[idx] = (global_id.z << 26) | (global_id.y << 13) | global_id.x;
+  xyz_array[idx] = (global_id.z << 28) | (global_id.y << 14) | global_id.x;
 }"""
             ]
       }
@@ -391,7 +404,7 @@ makeAntiAliasStage device = do
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> rg_array : array<rg>;
 @group(1) @binding(1) var<storage, read_write> bmeta_array : array<bmeta>;
-@group(2) @binding(0) var<storage, read_write> result_array : array<f32>;
+@group(2) @binding(0) var<storage, read_write> result_array : array<u32>;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   if (global_id.x >= rendering_info.real_canvas_width  || global_id.y >= rendering_info.canvas_height) {
@@ -399,12 +412,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   }
   var idx = (global_id.y * rendering_info.real_canvas_width + global_id.x);
   var overshot_idx = global_id.x + (global_id.y * rendering_info.overshot_canvas_width);
-  var rgb = vec3<f32>(0.f, 0.f, 0.f);
+  var rgb = vec3<f32>(0.75f, 0.75f, 0.75f);
   var anti_alias_passes = f32(rendering_info.anti_alias_passes);
-  for (var i: i32 = 0; i < rendering_info.anti_alias_passes; i++) {
+  for (var i: u32 = 0; i < rendering_info.anti_alias_passes; i++) {
     rgb += vec3(rg_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].r, rg_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].g, bmeta_array[idx + i * rendering_info.real_canvas_width * rendering_info.canvas_height].b) / anti_alias_passes;
   }
-  result_array[overshot_idx] = pack4x8unorm(rgb.b, rgb.g, rgb.r, 1.f);
+  result_array[overshot_idx] = pack4x8unorm(vec4(rgb.b, rgb.g, rgb.r, 1.f));
 }
 """
               ]
@@ -424,6 +437,7 @@ makeUbershaderStage device = do
       { code:
           intercalate "\n"
             [ inputData
+            , readBitmask
             , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
@@ -433,20 +447,21 @@ makeUbershaderStage device = do
 @group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  var ix = (global_id.z * position_info.y * position_info.x) + (global_id.y * position_info.x) + global_id.x;
+  var ix = (global_id.z * workgroup_limits.y * workgroup_limits.x) + (global_id.y * workgroup_limits.x) + global_id.x;
   if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
     return;
   }
   var xyz_bitmask = xyz_array[ix];
-  var x = read_x_from_bitmask(xyz_bitmask);
-  var y = read_y_from_bitmask(xyz_bitmask);
-  var z = read_z_from_bitmask(xyz_bitmask);
+  var x = read_x_at_bitmask(xyz_bitmask);
+  var y = read_y_at_bitmask(xyz_bitmask);
+  var z = read_z_at_bitmask(xyz_bitmask);
   var idx = (z * rendering_info.canvas_height * rendering_info.real_canvas_width) + (y * rendering_info.real_canvas_width) + x;
   rg_array[idx].r = f32(x) / f32(rendering_info.real_canvas_width);
   rg_array[idx].g = f32(y) / f32(rendering_info.canvas_height);
   bmeta_array[idx].b = 0.5f;
   var fresh_ix = atomicAdd(&workgroup_limits.c, 1);
-  xyz_array[fresh_ix] = z << 26 | y << 13 | x;
+  xyz_array[fresh_ix] = (z << 28) | (y << 14) | x;
+  //xyz_array[idx] = (z << 28) | (y << 14) | x;
 }"""
             ]
       }
@@ -600,20 +615,17 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           , label: "wBindGroupLayout"
           }
     -- for when we are reading from a context and writing to a buffer
-    readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ]
-
-      , label: "readOPipelineLayout"
-      }
     antiAliasPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout, wBindGroupLayout ]
-      , label: "readOPipelineLayout"
+      , label: "antiAliasPipelineLayout"
+      }
+    dasUbershaderPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout, wBindGroupLayout ]
+      , label: "dasUbershaderPipelineLayout"
       }
     initializeStuffPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout ]
-
       , label: "initializeStuffPipelineLayout"
-
       }
     readerBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: readerBindGroupLayout
@@ -662,7 +674,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , label: "initializeStuffPipeline"
       }
     dasUbershaderPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readOPipelineLayout
+      { layout: dasUbershaderPipelineLayout
       , compute: dasUbershaderStage
       , label: "dasUbershaderPipeline"
       }
@@ -780,7 +792,7 @@ main = do
           []
       , D.div
           Alt.do
-            klass_ "absolute p-3 text-slate-900"
+            klass_ "absolute p-3 text-slate-300"
           [ errorMessage.event $> false <|> pure true <#~>
               if _ then
                 text (_.avgTime >>> show >>> ("Avg time: " <> _) <$> frameInfo.event)
