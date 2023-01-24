@@ -444,24 +444,10 @@ makeUbershaderStage device = do
 @group(1) @binding(0) var<storage, read_write> rg_array : array<rg>;
 @group(1) @binding(1) var<storage, read_write> bmeta_array : array<bmeta>;
 @group(1) @binding(2) var<storage, read_write> xyz_array : array<u32>;
-@group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  var ix = (global_id.z * workgroup_limits.y * workgroup_limits.x) + (global_id.y * workgroup_limits.x) + global_id.x;
-  if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
-    return;
-  }
-  //var xyz_bitmask = xyz_array[ix];
-  //var x = read_x_at_bitmask(xyz_bitmask);
-  //var y = read_y_at_bitmask(xyz_bitmask);
-  //var z = read_z_at_bitmask(xyz_bitmask);
-  //var idx = (z * rendering_info.canvas_height * rendering_info.real_canvas_width) + (y * rendering_info.real_canvas_width) + x;
-  //rg_array[idx].r = f32(x) / f32(rendering_info.real_canvas_width);
-  //rg_array[idx].g = f32(y) / f32(rendering_info.canvas_height);
-  //bmeta_array[idx].b = 0.5f;
-  //var fresh_ix = atomicAdd(&workgroup_limits.c, 1);
-  //xyz_array[fresh_ix] = (z << 28) | (y << 14) | x;
-  xyz_array[ix] =42u;// (z << 28) | (y << 14) | x;
+  var ix = 55u;
+  xyz_array[ix] =42u;
 }"""
             ]
       }
@@ -620,7 +606,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , label: "antiAliasPipelineLayout"
       }
     dasUbershaderPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout, wBindGroupLayout ]
+      { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout ]
       , label: "dasUbershaderPipelineLayout"
       }
     initializeStuffPipelineLayout <- liftEffect $ createPipelineLayout device $ x
@@ -740,19 +726,20 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         --------------------
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           initializeStuffBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder initializeStuffPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
+        -- GPUComputePassEncoder.setPipeline computePassEncoder initializeStuffPipeline
+        -- GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
         --------------------
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
+        -- GPUComputePassEncoder.setBindGroup computePassEncoder 2
+        --     =<< makePositionBindGroup 0 -- (i * 256)
         foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x, y, z })) -> do
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            =<< makePositionBindGroup (i * 256)
+
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder x y z
         --
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           wholeCanvasBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder antiAliasPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
+        -- GPUComputePassEncoder.setPipeline computePassEncoder antiAliasPipeline
+        -- GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
           commandEncoder
