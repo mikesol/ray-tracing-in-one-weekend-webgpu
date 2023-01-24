@@ -389,7 +389,9 @@ makeUbershaderStage device = do
             , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
+@group(1) @binding(0) var<storage, read_write> rg_array : array<rg>;
+@group(1) @binding(1) var<storage, read_write> bmeta_array : array<bmeta>;
+@group(1) @binding(2) var<storage, read_write> xyz_array : array<u32>;
 @group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
