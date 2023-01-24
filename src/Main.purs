@@ -433,78 +433,20 @@ makeUbershaderStage device = do
 @group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  var ix = global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x;
+  var ix = (global_id.z * position_info.y * position_info.x) + (global_id.y * position_info.x) + global_id.x;
   if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
     return;
   }
-  var m = vec4(sin(f32(global_id.x))*0.5+0.5,0.0,0.0,1.0);
-  m.y = sin(f32(global_id.y))*0.5+0.5;
-  m.z = cos(f32(global_id.z))*0.5+0.5;
-  if (global_id.x % 2u == 0u) {
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-      m.x = sin(f32(m.x))*0.5+0.5;
-      m.y = sin(f32(m.y))*0.5+0.5;
-      m.z = cos(f32(m.z))*0.5+0.5;
-  } else {
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;
-      m.x = cos(f32(m.x))*0.5+0.5;
-      m.y = cos(f32(m.y))*0.5+0.5;
-      m.z = sin(f32(m.z))*0.5+0.5;    
-  }
-  var z = atomicAdd(&workgroup_limits.c, 1);
-  result_array[ix] = pack4x8unorm(sin(m*f32(z))*0.5+0.5);
+  var xyz_bitmask = xyz_array[ix];
+  var x = read_x_from_bitmask(xyz_bitmask);
+  var y = read_y_from_bitmask(xyz_bitmask);
+  var z = read_z_from_bitmask(xyz_bitmask);
+  var idx = (z * rendering_info.canvas_height * rendering_info.real_canvas_width) + (y * rendering_info.real_canvas_width) + x;
+  rg_array[idx].r = f32(x) / f32(rendering_info.real_canvas_width);
+  rg_array[idx].g = f32(y) / f32(rendering_info.canvas_height);
+  bmeta_array[idx].b = 0.5f;
+  var fresh_ix = atomicAdd(&workgroup_limits.c, 1);
+  xyz_array[fresh_ix] = z << 26 | y << 13 | x;
 }"""
             ]
       }
@@ -797,6 +739,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         --
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           wholeCanvasBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder antiAliasPipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
           commandEncoder
