@@ -105,13 +105,6 @@ struct rendering_info_struct {
   anti_alias_passes: u32, // number of spheres
   current_time: f32 // current time in seconds
 }
-
-struct position_info {
-  x: u32,
-  y: u32,
-  z: u32,
-  c: atomic<u32>
-}
 """
 
 type NodeBounds =
@@ -165,6 +158,10 @@ keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth :: Number
 keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth x =
   if x < 0.1 then 1.0
   else interpolate 0.1 1.0 1.0 0.125 x
+
+keepEverythingTheSame :: Number -> Number
+keepEverythingTheSame x = x
+
 
 newtype Sphere = Sphere Sphere'
 
@@ -414,7 +411,6 @@ struct foo_bar {
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> result_array : array<foo_bar>;
-@group(2) @binding(0) var<storage, read_write> workgroup_limits : position_info;
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var ix = global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x;
@@ -425,8 +421,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var m = unpack4x8unorm(y.foo);
   var n = unpack4x8unorm(y.bar);
   m += n;
+  if (m.x > 1.f) {
+    return;
+  }
   m.y = sin(f32(global_id.y))*0.5+0.5;
   m.z = cos(f32(global_id.z))*0.5+0.5;
+  for (var i = 0u; i < 1024u; i = i + 1u) {
+
   if (global_id.x % 2u == 0u) {
       m.x = sin(f32(m.x))*0.5+0.5;
       m.y = sin(f32(m.y))*0.5+0.5;
@@ -489,7 +490,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       m.x = cos(f32(m.x))*0.5+0.5;
       m.y = cos(f32(m.y))*0.5+0.5;
       m.z = sin(f32(m.z))*0.5+0.5;    
-  }
+  }  }
+
   var fb: foo_bar;
   fb.foo = pack4x8unorm(m);
   fb.bar = pack4x8unorm(m)*2u;
@@ -503,6 +505,43 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         { "module": dasUbershaderModule
         , entryPoint: "main"
         }
+    ----
+    let
+      initializerDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , """
+struct foo_bar {
+  foo: u32,
+  bar: u32
+}
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> result_array : array<foo_bar>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  var ix = global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height + global_id.y * rendering_info.real_canvas_width + global_id.x;
+  if (ix >= rendering_info.real_canvas_width * rendering_info.canvas_height * rendering_info.anti_alias_passes) {
+    return;
+  }
+  var fb: foo_bar;
+  fb.foo = pack4x8unorm(vec4(1.0,0.8,0.4,0.2));
+  fb.bar = pack4x8unorm(vec4(0.2,0.8,0.3,0.1));
+  result_array[ix] = fb;
+}"""
+              ]
+        }
+    initializerModule <- liftEffect $ createShaderModule device initializerDesc
+    let
+      (initializerStage :: GPUProgrammableStage) = x
+        { "module": initializerModule
+        , entryPoint: "main"
+        }
+    ----
+
+
+
     readerBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
@@ -535,7 +574,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           }
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout ] }
     readerBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: readerBindGroupLayout
       , entries:
@@ -562,6 +601,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                 (x { buffer: wholeCanvasBuffer, offset } :: GPUBufferBinding)
             ]
         }
+    initializerPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: initializerStage
+      }
+
     dasUbershaderPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: dasUbershaderStage
@@ -617,14 +661,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        -- clear workgroups
-        GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           dasUbershaderBindGroup
-        foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x,y,z})) -> do
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            =<< makePositionBindGroup (i * 256)
-          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder x y z
+        -- clear workgroups
+        GPUComputePassEncoder.setPipeline computePassEncoder initializerPipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
+        -- run loop
+        GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
+        -- foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x,y,z})) -> do
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
         --
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
