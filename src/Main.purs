@@ -62,14 +62,15 @@ import Web.GPU.GPUBufferUsage as GPUBufferUsage
 import Web.GPU.GPUCanvasAlphaMode (opaque)
 import Web.GPU.GPUCanvasConfiguration (GPUCanvasConfiguration)
 import Web.GPU.GPUCanvasContext (configure, getCurrentTexture)
-import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToTexture, finish)
+import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToBuffer, copyBufferToTexture, finish)
 import Web.GPU.GPUComputePassEncoder as GPUComputePassEncoder
 import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule, limits)
 import Web.GPU.GPUDevice as GPUDevice
 import Web.GPU.GPUExtent3D (gpuExtent3DWH)
 import Web.GPU.GPUMapMode as GPUMapMode
-import Web.GPU.GPUProgrammableStage (GPUProgrammableStage)
+import Web.GPU.GPUProgrammableStage (GPUProgrammableStage(..))
 import Web.GPU.GPUQueue (onSubmittedWorkDone, submit, writeBuffer)
+import Web.GPU.GPUShaderStage (GPUShaderStage)
 import Web.GPU.GPUShaderStage as GPUShaderStage
 import Web.GPU.GPUTextureFormat as GPUTextureFormat
 import Web.GPU.GPUTextureUsage as GPUTextureUsage
@@ -86,7 +87,7 @@ testNSpheres :: Int
 testNSpheres = 512
 
 testAntiAliasMax :: Int
-testAntiAliasMax = 4
+testAntiAliasMax = 8
 
 testBounces :: Int
 testBounces = 32
@@ -100,7 +101,9 @@ struct rendering_info_struct {
   real_canvas_width: u32, // width of the canvas in pixels
   overshot_canvas_width: u32, // width of the canvas in pixels so that the byte count per pixel is a multiple of 256
   canvas_height: u32, // height of the canvas in pixels
-  n_spheres: u32, // number of spheres
+  starting_compute_x: u32, // starting compute global x
+  starting_compute_y: u32, // starting compute global y
+  starting_compute_z: u32, // starting compute global z
   n_bvh_nodes: u32, // number of bvh_nodes
   anti_alias_passes: u32, // number of spheres
   current_time: f32 // current time in seconds
@@ -111,6 +114,16 @@ struct position_info {
   y: u32,
   z: u32,
   c: atomic<u32>
+}
+
+struct rg {
+  r: f32,
+  g: f32
+}
+
+struct bmeta {
+  b: f32,
+  m: u32
 }
 """
 
@@ -142,7 +155,10 @@ type Sphere' =
   }
 
 newtype XYZ = XYZ { x :: Int, y :: Int, z :: Int }
+
 derive newtype instance Show XYZ
+derive instance Newtype XYZ _
+
 interpolateXYZOverRange :: (Number -> Number) -> Int -> XYZ -> Array XYZ
 interpolateXYZOverRange f i (XYZ { x, y, z }) = (0 .. (i - 1)) <#> \j ->
   let
@@ -161,11 +177,11 @@ interpolate x0 y0 x1 y1 x =
   in
     y0 + m * (x - x0)
 
-keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth :: Number -> Number
-keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth x =
+keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneTwentieth :: Number -> Number
+keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneTwentieth x =
   if x < 0.1 then 1.0
-  else interpolate 0.1 1.0 1.0 0.125 x
-
+  else if x < 0.5 then interpolate 0.1 1.0 0.5 0.3 x
+  else interpolate 0.5 0.3 1.0 0.05 x
 newtype Sphere = Sphere Sphere'
 
 derive instance Newtype Sphere _
@@ -328,85 +344,49 @@ bvhNodesToFloat32Array arr = do
       , fromNumber' aabb_max_z
       ] <> tlv
 
-gpuMe :: Effect Unit -> (FrameInfo -> Effect Unit) -> HTMLCanvasElement -> Effect Unit
-gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 250.0) *> liftEffect do
-  context <- getContext canvas >>= maybe
-    (showErrorMessage *> throwError (error "could not find context"))
-    pure
-  timeDeltaAverager <- averager
-  frameDeltaAverager <- averager
-  startsAt <- getTime <$> now
-  currentFrame <- Ref.new 0
-  entry <- window >>= navigator >>= gpu >>= case _ of
-    Nothing -> do
-      showErrorMessage
-      throwError $ error "WebGPU is not supported"
-    Just entry -> pure entry
-  launchAff_ do
-    adapter <- (toAffE $ convertPromise <$> requestAdapter entry (x {})) >>=
-      case _ of
-        Nothing -> liftEffect do
-          showErrorMessage
-          throwError $ error "WebGPU is not supported"
-        Just adapter -> pure adapter
-    device <- (toAffE $ convertPromise <$> requestDevice adapter (x {})) >>=
-      case _ of
-        Nothing -> liftEffect do
-          showErrorMessage
-          throwError $ error "WebGPU is not supported"
-        Just device -> pure device
-    queue <- liftEffect $ GPUDevice.queue device
-    deviceLimits <- liftEffect $ limits device
-    --------------------------
-    -- range
-    let
-      xyzs =
-        interpolateXYZOverRange keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneEighth (8 * 16) (XYZ { x: 64, y: 32, z: 32 })
-    positions :: Uint32Array <- liftEffect $ fromArray $ join $ (map (\(XYZ { x, y, z }) -> [ fromInt x, 
-    fromInt y, fromInt z ] <> map fromInt (replicate 61 0)) xyzs)
-    positionBuffer <- liftEffect $ createBufferF device positions GPUBufferUsage.storage
-    canvasInfoBuffer <- liftEffect $ createBuffer device $ x
-      { size: 28 -- align(4) size(28)
-      , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
+makeRGBMetaXYZShaderStage :: GPUDevice -> Effect GPUProgrammableStage
+makeRGBMetaXYZShaderStage device = do
+  let
+    shaderDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , """
+// main
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> rg_array : array<rg>;
+@group(1) @binding(1) var<storage, read_write> bmeta_array : array<bmeta>;
+@group(1) @binding(2) var<storage, read_write> xyz_array : array<u32>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  if (global_id.x >= rendering_info.real_canvas_width || global_id.y >= rendering_info.canvas_height || global_id.z >= rendering_info.anti_alias_passes) {
+    return;
+  }
+  var idx = (global_id.x % rendering_info.real_canvas_width) + ((global_id.y * rendering_info.real_canvas_width) % rendering_info.canvas_height) + ((global_id.z * rendering_info.real_canvas_width * rendering_info.canvas_height) % rendering_info.anti_alias_passes);
+  rg_array[idx].r = 1.f;
+  rg_array[idx].g = 1.f;
+  bmeta_array[idx].b = 1.f;
+  bmeta_array[idx].m = 0u;
+  xyz_array[idx] = (global_id.z << 26) | (global_id.y << 13) | global_id.x;
+}"""
+            ]
       }
-    bvhNodeBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.storage
+  shaderModule <- createShaderModule device shaderDesc
+  let
+    (shaderStage :: GPUProgrammableStage) = x
+      { "module": shaderModule
+      , entryPoint: "main"
       }
-    sphereBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.storage
-      }
-    seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate (testNSpheres - 2) $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.06 } <$> (random <#> \n -> n * 8.0 - 4.0) <*> (random <#> \n -> n * 8.0 - 4.0))
-    let
-      spheres =
-        cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
-          ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-            ] <> randos
-          )
-      bvhNodes = spheresToBVHNodes seed spheres
-      rawSphereData = map fromNumber' (spheresToFlatRep spheres)
-    --logShow bvhNodes
-    --logShow spheres
-    bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
-    let nSpheres = NEA.length spheres
-    let nBVHNodes = NEA.length bvhNodes
-    sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
-    workgroupManagementBuffer <- liftEffect $ createBuffer device $ x
-      { size: 1 `shl` 15
-      , usage: GPUBufferUsage.storage
-      }
-    wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
-      }
-    let
-      dasUbershaderDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , """
+  pure shaderStage
+
+makeUbershaderStage :: GPUDevice -> Effect GPUProgrammableStage
+makeUbershaderStage device = do
+  let
+    shaderDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , """
 // main
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
@@ -486,14 +466,132 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var z = atomicAdd(&workgroup_limits.c, 1);
   result_array[ix] = pack4x8unorm(sin(m*f32(z))*0.5+0.5);
 }"""
-              ]
-        }
-    dasUbershaderModule <- liftEffect $ createShaderModule device dasUbershaderDesc
+            ]
+      }
+  shaderModule <- createShaderModule device shaderDesc
+  let
+    (shaderStage :: GPUProgrammableStage) = x
+      { "module": shaderModule
+      , entryPoint: "main"
+      }
+  pure shaderStage
+
+gpuMe :: Effect Unit -> (FrameInfo -> Effect Unit) -> HTMLCanvasElement -> Effect Unit
+gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 250.0) *> liftEffect do
+  context <- getContext canvas >>= maybe
+    (showErrorMessage *> throwError (error "could not find context"))
+    pure
+  timeDeltaAverager <- averager
+  frameDeltaAverager <- averager
+  startsAt <- getTime <$> now
+  currentFrame <- Ref.new 0
+  entry <- window >>= navigator >>= gpu >>= case _ of
+    Nothing -> do
+      showErrorMessage
+      throwError $ error "WebGPU is not supported"
+    Just entry -> pure entry
+  launchAff_ do
+    adapter <- (toAffE $ convertPromise <$> requestAdapter entry (x {})) >>=
+      case _ of
+        Nothing -> liftEffect do
+          showErrorMessage
+          throwError $ error "WebGPU is not supported"
+        Just adapter -> pure adapter
+    device <- (toAffE $ convertPromise <$> requestDevice adapter (x {})) >>=
+      case _ of
+        Nothing -> liftEffect do
+          showErrorMessage
+          throwError $ error "WebGPU is not supported"
+        Just device -> pure device
+    let maxCanvasWidth = 2048
+    let maxCanvasHeight = 1024
+    let maxAntiAlias = 8
+    queue <- liftEffect $ GPUDevice.queue device
+    deviceLimits <- liftEffect $ limits device
+    --------------------------
+    -- range
     let
-      (dasUbershaderStage :: GPUProgrammableStage) = x
-        { "module": dasUbershaderModule
-        , entryPoint: "main"
-        }
+      baseXYZ = XYZ { x: 64, y: 32, z: 32 }
+      xyzs =
+        interpolateXYZOverRange keepEverythingTheSameForABitThenDecreaseProgressivelyToAroundOneTwentieth (8 * 16) (baseXYZ)
+    canvasInfoBuffer <- liftEffect $ createBuffer device $ x
+      { size: 36 -- align(4) size(36)
+      , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
+      }
+    workgroupInfo :: Uint32Array <- liftEffect $ fromArray $ join $
+      ( map (\(XYZ { x, y, z }) -> [ fromInt x, fromInt y, fromInt z ] <> map fromInt (replicate 61 0)) xyzs
+      )
+    workgroupInfoBuffer <- liftEffect $ createBufferF device workgroupInfo GPUBufferUsage.storage
+    rgStashBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.copyDst
+      }
+    -- metadata is 32 bytes
+    -- first 16 bytes is the index of the bvh
+    -- next 8 bytes is the level of the bvh
+    -- next byte is whether it's a bvh or multiply
+    -- next byte is whether we're done
+    -- (26 total)
+    bMetadataStashBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.copyDst
+      }
+    xyzStashBuffer <- liftEffect $ createBuffer device $ x
+      { size: maxCanvasWidth * maxCanvasHeight * maxAntiAlias * 4
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.copyDst
+      }
+    rgStashBuffer2 <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.copySrc
+      }
+    -- metadata is 32 bytes
+    -- first 16 bytes is the index of the bvh
+    -- next 8 bytes is the level of the bvh
+    -- next byte is whether it's a bvh or multiply
+    -- next byte is whether we're done
+    -- (26 total)
+    bMetadataStashBuffer2 <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.copySrc
+      }
+    xyzStashBuffer2 <- liftEffect $ createBuffer device $ x
+      { size: maxCanvasWidth * maxCanvasHeight * maxAntiAlias * 4
+      , usage: GPUBufferUsage.copySrc
+      }
+    bvhNodeBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage
+      }
+    sphereBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.storage
+      }
+    seed <- liftEffect $ randomInt 42 42424242
+    randos <- liftEffect $ sequence $ replicate (testNSpheres - 2) $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.06 } <$> (random <#> \n -> n * 8.0 - 4.0) <*> (random <#> \n -> n * 8.0 - 4.0))
+    let
+      spheres =
+        cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
+          ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
+            ] <> randos
+          )
+      bvhNodes = spheresToBVHNodes seed spheres
+      rawSphereData = map fromNumber' (spheresToFlatRep spheres)
+    --logShow bvhNodes
+    --logShow spheres
+    bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
+    let nSpheres = NEA.length spheres
+    let nBVHNodes = NEA.length bvhNodes
+    sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
+    workgroupManagementBuffer <- liftEffect $ createBuffer device $ x
+      { size: 1 `shl` 15
+      , usage: GPUBufferUsage.storage
+      }
+    wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
+      { size: deviceLimits.maxStorageBufferBindingSize
+      , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
+      }
+    dasUbershaderStage <- liftEffect $ makeUbershaderStage device
+    rgbmetaxyzShaderStage <- liftEffect $ makeRGBMetaXYZShaderStage device
     readerBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
@@ -514,7 +612,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+          , label: "readerBindGroupLayout"
           }
+    initializeStuffBindGroupLayout <- liftEffect $ createBindGroupLayout device
+      $ x
+          { entries:
+              (0 .. 2) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
+                ( x { type: GPUBufferBindingType.storage }
+                    :: GPUBufferBindingLayout
+                )
+          , label: "initializeStuffBindGroupLayout"
+          }
+
     wBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
@@ -523,10 +632,20 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                       :: GPUBufferBindingLayout
                   )
               ]
+          , label: "wBindGroupLayout"
           }
     -- for when we are reading from a context and writing to a buffer
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ] }
+      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout ]
+
+      , label: "readOPipelineLayout"
+      }
+    initializeStuffPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, initializeStuffBindGroupLayout ]
+
+      , label: "initializeStuffPipelineLayout"
+
+      }
     readerBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: readerBindGroupLayout
       , entries:
@@ -537,6 +656,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , gpuBindGroupEntry 2
               (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
           ]
+      , label: "readerBindGroup"
+      }
+    initializeStuffBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: initializeStuffBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: rgStashBuffer } :: GPUBufferBinding)
+          , gpuBindGroupEntry 1
+              (x { buffer: bMetadataStashBuffer } :: GPUBufferBinding)
+          , gpuBindGroupEntry 2
+              (x { buffer: xyzStashBuffer } :: GPUBufferBinding)
+          ]
+      , label: "initializeStuffBindGroup"
       }
     dasUbershaderBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
@@ -544,18 +676,26 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
           ]
+      , label: "dasUbershaderBindGroup"
       }
     let
       makePositionBindGroup offset = createBindGroup device $ x
         { layout: wBindGroupLayout
         , entries:
             [ gpuBindGroupEntry 0
-                (x { buffer: wholeCanvasBuffer, offset } :: GPUBufferBinding)
+                (x { buffer: workgroupInfoBuffer, offset } :: GPUBufferBinding)
             ]
+        , label: "positionBindGroup" <> show offset
         }
+    initializeStuffPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: initializeStuffPipelineLayout
+      , compute: rgbmetaxyzShaderStage
+      , label: "initializeStuffPipeline"
+      }
     dasUbershaderPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: dasUbershaderStage
+      , label: "dasUbershaderPipeline"
       }
     let
       (config :: GPUCanvasConfiguration) = x
@@ -592,7 +732,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ canvasWidth
           , overshotWidth
           , canvasHeight
-          , nSpheres
+          , (unwrap baseXYZ).x * 16 -- 16 is the workgroup size
+          , (unwrap baseXYZ).y * 16 -- 16 is the workgroup size
+          , (unwrap baseXYZ).z
           , nBVHNodes
           , antiAliasPasses
           , 0
@@ -603,16 +745,22 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         let wgz = 8
         whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 6) [ fromNumber' tn ]
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
-        -- not necessary in the loop, but useful as a stress test for animating positions
         computePassEncoder <- beginComputePass commandEncoder (x {})
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        -- clear workgroups
+        --------------------
+        --- initialize
+        --------------------
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          initializeStuffBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder initializeStuffPipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY testAntiAliasMax
+        --------------------
         GPUComputePassEncoder.setPipeline computePassEncoder dasUbershaderPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           dasUbershaderBindGroup
-        foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x,y,z})) -> do
+        foreachE (mapWithIndex Tuple xyzs) \(Tuple i (XYZ { x, y, z })) -> do
           GPUComputePassEncoder.setBindGroup computePassEncoder 2
             =<< makePositionBindGroup (i * 256)
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder x y z
