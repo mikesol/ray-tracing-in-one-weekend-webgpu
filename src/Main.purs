@@ -99,7 +99,10 @@ antiAliasPasses :: Int
 antiAliasPasses = 8
 
 totalPixels :: Int
-totalPixels = 4 * 4 * antiAliasPasses
+totalPixels = squareArea * antiAliasPasses
+
+maxingOutMemory = 4 :: Int
+arrLength = totalPixels * maxingOutMemory :: Int
 
 overcommit :: Int
 overcommit = totalPixels / kernelSize
@@ -543,12 +546,12 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
+    randos <- liftEffect $ sequence $ replicate 16 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
           ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-            ] -- <> randos
+            ] <> randos
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
@@ -617,6 +620,18 @@ fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
 
 // main
 
+fn pix_from_pixvol(pixvol: u32) -> u32 {
+  return pixvol & 0xffff;
+}
+
+fn vol_from_pixvol(pixvol: u32) -> u32 {
+  return pixvol >> 16;
+}
+
+fn pix_and_vol_to_pixvol(pix: u32, vol: u32) -> u32 {
+  return pix | (vol << 16);
+}
+
 var<workgroup> pxs: array<f32, """
             , show totalPixels
             , """>;
@@ -635,17 +650,15 @@ var<workgroup> colors: array<vec3<f32>, """
 var<workgroup> sphere_indices: array<u32, """
             , show totalPixels
             , """>;
-var<workgroup> needs_bvh: atomic<u32>;
-var<workgroup> needs_sphere: atomic<u32>;
-struct pix_vol {
-  pix: u32,
-  vol: u32
-}
-var<workgroup> bvh_ixs: array<pix_vol, """
-            , show (totalPixels * 2)
+var<workgroup> bvh_read_playhead: u32;
+var<workgroup> bvh_write_playhead: atomic<u32>;
+var<workgroup> sphere_read_playhead: u32;
+var<workgroup> sphere_write_playhead: atomic<u32>;
+var<workgroup> bvh_ixs: array<u32, """
+            , show (arrLength)
             , """>;
-var<workgroup> sphere_ixs: array<pix_vol, """
-            , show (totalPixels * 2)
+var<workgroup> sphere_ixs: array<u32, """
+            , show (arrLength)
             , """>;
 
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
@@ -713,38 +726,40 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     rays[ix].direction = lower_left_corner + vec3(px * ambitus_x, py * ambitus_y, 0.0);
     hits[ix] = 1000.f;
     sphere_indices[ix] = 0u;
+    var last_node_pixvol = pix_and_vol_to_pixvol(ix, last_node_ix);
     if (last_node.is_sphere == 1u) {
-      sphere_ixs[ix].pix = ix;
-      sphere_ixs[ix].vol = last_node_ix;
+      sphere_ixs[ix] = last_node_pixvol;
     } else {
-      bvh_ixs[ix].pix = ix;
-      bvh_ixs[ix].vol = last_node_ix;
+      bvh_ixs[ix] = last_node_pixvol;
     }
   }
   if (locxy == 0) {
     if (last_node.is_sphere == 1u) {
-      atomicStore(&needs_sphere, """
+      atomicStore(&sphere_write_playhead, """
             , show totalPixels
             , """);
     } else {
-      atomicStore(&needs_bvh, """
+      atomicStore(&bvh_write_playhead, """
             , show totalPixels
             , """);
     }
+    sphere_read_playhead = 0u;
+    bvh_read_playhead = 0u;
   }
-  workgroupBarrier();
-  for (var safe_cutoff: u32 = 0; safe_cutoff < 64u; safe_cutoff++) {
-    var currentBVH = atomicLoad(&needs_bvh);
-    var currentSphere = atomicLoad(&needs_sphere);
+  var bvh_playhead = 0u;
+  var sphere_playhead = 0u;
+  for (var safe_cutoff: u32 = 0; safe_cutoff < 128u; safe_cutoff++) {
+    workgroupBarrier();
+    var currentSphereWrite = atomicLoad(&sphere_write_playhead);
+    var currentBVHWrite = atomicLoad(&bvh_write_playhead);
+    var currentSphereRead = sphere_read_playhead;
+    var currentBVHRead = bvh_read_playhead;
+    var currentBVH = currentBVHWrite - currentBVHRead;
+    var currentSphere = currentSphereWrite - currentSphereRead;
     workgroupBarrier();
     var currentOpN = max(currentBVH, currentSphere);
+    var currentOp = select(1, 0, currentOpN == currentBVH);
     if (currentOpN != 0) {
-      var currentOp = select(1, 0, currentOpN == currentBVH);
-      var currentOpNRemainder = select(0u, currentOpN - """
-            , show kernelSize
-            , """, currentOpN > """
-            , show kernelSize
-            , """);
       currentOpN = min("""
             , show kernelSize
             , """, currentOpN);
@@ -754,39 +769,49 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
           default: {}
           case 0: {
             // bvh
-            var bloc = bvh_ixs[locxy];
-            var node = bvh_nodes[bloc.vol];
-            var ray = rays[bloc.pix];
+            var bloc = bvh_ixs[(locxy + currentBVHRead) % """
+            , show (arrLength)
+            , """];
+            var bloc_pix = pix_from_pixvol(bloc);
+            var node = bvh_nodes[vol_from_pixvol(bloc)];
+            var ray = rays[bloc_pix];
             var bbox: aabb;
             bvh_node_bounding_box(&node, &bbox);
             var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
             /////
             if (was_aabb_hit) {
               if (bvh_nodes[node.left].is_sphere == 1u) {
-                var ix = atomicAdd(&needs_sphere, 1u);
-                sphere_ixs[ix].pix = bloc.pix;
-                sphere_ixs[ix].vol = node.left;
+                var ix = atomicAdd(&sphere_write_playhead, 1u);
+                sphere_ixs[(ix) % """
+            , show (arrLength)
+            , """] = pix_and_vol_to_pixvol(bloc_pix, node.left);
               } else {
-                var ix = atomicAdd(&needs_bvh, 1u);
-                bvh_ixs[ix].pix = bloc.pix;
-                bvh_ixs[ix].vol = node.left;
+                var ix = atomicAdd(&bvh_write_playhead, 1u);
+                bvh_ixs[(ix) % """
+            , show (arrLength)
+            , """] = pix_and_vol_to_pixvol(bloc_pix, node.left);
               }
               if (bvh_nodes[node.right].is_sphere == 1u) {
-                var ix = atomicAdd(&needs_sphere, 1u);
-                sphere_ixs[ix].pix = bloc.pix;
-                sphere_ixs[ix].vol = node.right;
+                var ix = atomicAdd(&sphere_write_playhead, 1u);
+                sphere_ixs[(ix) % """
+            , show (arrLength)
+            , """] = pix_and_vol_to_pixvol(bloc_pix, node.right);
               } else {
-                var ix = atomicAdd(&needs_bvh, 1u);
-                bvh_ixs[ix].pix = bloc.pix;
-                bvh_ixs[ix].vol = node.right;
+                var ix = atomicAdd(&bvh_write_playhead, 1u);
+                bvh_ixs[(ix) % """
+            , show (arrLength)
+            , """] = pix_and_vol_to_pixvol(bloc_pix, node.right);
               }
             }
           }
           case 1: {
             // sphere
-            var sloc = sphere_ixs[locxy];
-            var node = bvh_nodes[sloc.vol];
-            var ray = rays[sloc.pix];
+            var sloc = sphere_ixs[(locxy + currentSphereRead) % """
+            , show (arrLength)
+            , """];
+            var node = bvh_nodes[vol_from_pixvol(sloc)];
+            var sloc_pix = pix_from_pixvol(sloc);
+            var ray = rays[sloc_pix];
             var hit_t: f32;
             var sphere_ix = node.left * 4u;
             var sphere_hit = hit_sphere(
@@ -799,55 +824,33 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
               t_max,
               &hit_t);
             var i_plus_1 = node.left + 1u;
-            var old_t = hits[sloc.pix];
+            var old_t = hits[sloc_pix];
             var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
-            hits[sloc.pix] = new_t;
+            hits[sloc_pix] = new_t;
             ///
-            var old_ix = sphere_indices[sloc.pix];
-            sphere_indices[sloc.pix] =
+            var old_ix = sphere_indices[sloc_pix];
+            sphere_indices[sloc_pix] =
               select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
-          }
-        }
-      }
-      switch currentOp {
-        default: {}
-        case 0: {
-          // shift work down
-          // clear bvh
-          if (locxy == 0) {
-            atomicStore(&needs_bvh, currentOpNRemainder);
-          }
-          for (var i: u32 = """
-        , show 0
-        , """; i < """
-        , show totalPixels
-        , """; i += """
-        , show kernelSize
-        , """) {
-              if (i + locxy + currentOpN < """, show totalPixels, """) {              
-                bvh_ixs[i + locxy] = bvh_ixs[i + locxy + currentOpN];
-              }
-          }
-        }
-        case 1: {
-          if (locxy == 0) {
-            atomicStore(&needs_sphere, currentOpNRemainder);
-          }
-          for (var i: u32 = """
-        , show 0
-        , """; i < """
-        , show totalPixels
-        , """; i += """
-        , show kernelSize
-        , """) {
-              if (i + locxy + currentOpN < """, show totalPixels, """) {              
-                sphere_ixs[i + locxy] = sphere_ixs[i + locxy + currentOpN];
-              }
           }
         }
       }
     }
     workgroupBarrier();
+    if (currentOpN != 0) {
+      switch currentOp {
+        default: {}
+        case 0: {
+          if (locxy == 0) {
+            bvh_read_playhead += currentOpN;
+          }
+        }
+        case 1: {
+          if (locxy == 0) {
+            sphere_read_playhead += currentOpN;
+          }
+        }
+      }
+    }
   }
   for (var i: u32 = 0; i < """
             , show totalPixels
@@ -1008,8 +1011,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
         commandEncoder <- createCommandEncoder device (x {})
         let workgroupOvershootX = ceil (toNumber overshotWidth / 16.0)
         let workgroupOvershootY = ceil (toNumber overshotWidth / 16.0)
-        let workgroupX = ceil (toNumber canvasWidth / 4.0)
-        let workgroupY = ceil (toNumber canvasHeight / 4.0)
+        let workgroupX = ceil (toNumber canvasWidth / toNumber squareSide)
+        let workgroupY = ceil (toNumber canvasHeight / toNumber squareSide)
         cinfo <- fromArray $ map fromInt
           [ canvasWidth
           , overshotWidth
