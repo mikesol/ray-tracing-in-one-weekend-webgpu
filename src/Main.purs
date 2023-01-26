@@ -29,7 +29,7 @@ import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
-
+import Debug (spy)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (id_, klass_)
 import Deku.Control (text, text_, (<#~>))
@@ -87,6 +87,11 @@ kernelX = 16
 kernelY :: Int
 kernelY = 4
 
+squareSide :: Int
+squareSide = 4
+
+squareArea = squareSide * squareSide :: Int
+
 kernelSize :: Int
 kernelSize = kernelX * kernelY
 
@@ -114,76 +119,6 @@ struct rendering_info_struct {
   current_time: f32 // current time in seconds
 }
 """
-
-readWriteAtLevel :: String
-readWriteAtLevel =
-  """
-fn read_at_level(bitmask: u32, level: u32, lr: bool) -> bool {
-  var spot = level * 2u + select(1u, 0u, lr);
-  return (bitmask & (1u << spot)) != 0;
-}
-fn read_at_left(bitmask: u32, level: u32) -> bool {
-  return read_at_level(bitmask, level, true);
-}
-fn read_at_right(bitmask: u32, level: u32) -> bool {
-  return read_at_level(bitmask, level, false);
-}
-fn write_at_level(bitmask: u32, level: u32, lr: bool, val: bool) -> u32 {
-  var spot = level * 2u + select(1u, 0u, lr);
-  return select(bitmask & ~ (1u << spot), bitmask | (1u << spot), val);
-}
-fn write_at_left(bitmask: u32, level: u32, val: bool) -> u32 {
-  return write_at_level(bitmask, level, true, val);
-}
-fn write_at_right(bitmask: u32, level: u32, val: bool) -> u32 {
-  return write_at_level(bitmask, level, false, val);
-}
-fn read_stack_at_bitmask(bitmask: u32) -> u32 {
-  return bitmask >> 24;
-}
-fn write_stack_at_bitmask(bitmask: u32, stack: u32) -> u32 {
-  return (bitmask & 0xFFFFFF) | (stack << 24);
-}
-fn read_x_at_bitmask(xyz: u32) -> u32 {
-  return xyz & 0x3fff; // range [0,14)
-}
-fn read_y_at_bitmask(xyz: u32) -> u32 {
-  return (xyz >> 14u) & 0x3fff; // range [14,28)
-}
-fn read_z_at_bitmask(xyz: u32) -> u32 {
-  return xyz >> 28u; // range [28,32)
-}
-fn write_x_at_bitmask(xyz: u32, x: u32) -> u32 {
-  return (xyz & 0xFFFFC000) | x;
-}
-fn write_y_at_bitmask(xyz: u32, y: u32) -> u32 {
-  return (xyz & 0xFFFC3FFF) | (y << 14u);
-}
-fn write_z_at_bitmask(xyz: u32, z: u32) -> u32 {
-  return (xyz & 0x3FFFFFFF) | (z << 28u);
-}
-  """
-
-getTAndIx :: String
-getTAndIx =
-  """
-struct t_and_ix {
-  t: f32,
-  ix: u32
-}
-
-fn u32_to_t_and_ix(i: u32, p: ptr<function, t_and_ix>) -> bool {
-  var out = unpack2x16float(i);
-  (*p).t = out.y;
-  (*p).ix = u32(out.x);
-  return true;
-}
-
-fn t_and_ix_to_u32(p: ptr<function, t_and_ix>) -> u32 {
-  // offset by 0.1 to prevent rounding errors when stored
-  return pack2x16float(vec2(f32((*p).ix)+0.1, (*p).t));
-}
-  """
 
 aabb :: String
 aabb =
@@ -275,6 +210,11 @@ fn fuzz2(i: u32, n: u32, d: u32) -> f32
 {
     var fi = f32(i);
     return (fi + (fuzz_fac * pow(f32(n) / f32(d), 0.5) - half_fuzz_fac));
+}
+fn fuzz3(i: u32, n: u32, d: u32) -> f32
+{
+    var fi = f32(i);
+    return fi;
 }
 """
 
@@ -562,7 +502,7 @@ bvhNodesToFloat32Array arr = do
       ] <> tlv
 
 gpuMe :: Effect Unit -> (FrameInfo -> Effect Unit) -> HTMLCanvasElement -> Effect Unit
-gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 20.0) *> liftEffect do
+gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 250.0) *> liftEffect do
   context <- getContext canvas >>= maybe
     (showErrorMessage *> throwError (error "could not find context"))
     pure
@@ -603,12 +543,12 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 4.0 - 2.0) <*> (random <#> \n -> n * 4.0 - 2.0))
+    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
           ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-            ] <> randos
+            ] -- <> randos
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
@@ -647,7 +587,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     let
       mainComputeDesc = x
-        { code: intercalate "\n"
+        { code: spy "text" $ fold
             [ lerp
             , lerpv
             , inputData
@@ -658,8 +598,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
             , hitRecord
             , makeHitRec
             , aabb
-            , getTAndIx
-            , readWriteAtLevel
             , bvhNode
             , sphereBoundingBox
             , usefulConsts
@@ -688,9 +626,6 @@ var<workgroup> pys: array<f32, """
 var<workgroup> rays: array<ray, """
             , show totalPixels
             , """>;
-var<workgroup> bitmasks: array<u32, """
-            , show totalPixels
-            , """>;
 var<workgroup> hits: array<f32, """
             , show totalPixels
             , """>;
@@ -702,25 +637,26 @@ var<workgroup> sphere_indices: array<u32, """
             , """>;
 var<workgroup> needs_bvh: atomic<u32>;
 var<workgroup> needs_sphere: atomic<u32>;
-var<workgroup> needs_triage: atomic<u32>;
-var<workgroup> current_node: array<u32, """
-            , show totalPixels
+struct pix_vol {
+  pix: u32,
+  vol: u32
+}
+var<workgroup> bvh_ixs: array<pix_vol, """
+            , show (totalPixels * 2)
             , """>;
-var<workgroup> bvh_ixs: array<u32, """
-            , show totalPixels
-            , """>;
-var<workgroup> sphere_ixs: array<u32, """
-            , show totalPixels
-            , """>;
-var<workgroup> triage_ixs: array<u32, """
-            , show totalPixels
+var<workgroup> sphere_ixs: array<pix_vol, """
+            , show (totalPixels * 2)
             , """>;
 
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_nodes : array<bvh_node>;
 @group(1) @binding(0) var<storage, read_write> result_array : array<u32>;
-@compute @workgroup_size(16, 4, 1)
+@compute @workgroup_size("""
+            , show kernelX
+            , """, """
+            , show kernelY
+            , """, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
   var aa_f32 = f32("""
             , show antiAliasPasses
@@ -732,176 +668,125 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var lower_left_corner = vec3(-ambitus_x / 2.0, -ambitus_y / 2.0, -1.0);
   var t_min = 0.0001;
   var t_max = 10000.f;
-  var locy16 = local_id.y * 16;
-  var locxy = locy16 + local_id.x;
+  var locy = local_id.y * """
+            , show kernelX
+            , """;
+  var locxy = locy + local_id.x;
+  var last_node_ix = rendering_info.n_bvh_nodes - 1;
+  var last_node = bvh_nodes[last_node_ix];
   for (var i: u32 = 0; i < """
-            , show overcommit
-            , """; i += 64) {
+            , show totalPixels
+            , """;  i += """
+            , show kernelSize
+            , """) {
     var ix = locxy + i;
-    var xk = ix % 4;
-    var yk = (ix / 4) % 4;
-    var zk = ix / 16;
-    var real_x = (global_id.x / 4 ) + xk; // (_ * 4 / 16)
-    var real_y = (global_id.y) + yk; // (_ * 4 / 4)
-    var px = fuzz2(real_x, zk, """
+    var xk = ix % """
+            , show squareSide
+            , """;
+    var yk = (ix / """
+            , show squareSide
+            , """) % """
+            , show squareSide
+            , """;
+    var zk = ix / """
+            , show squareArea
+            , """;
+    var real_x = (global_id.x / """
+            , show kernelX
+            , """ ) * """
+            , show squareSide
+            , """ + xk;
+    var real_y = (global_id.y / """
+            , show kernelY
+            , """) * """
+            , show squareSide
+            , """ + yk;
+    var px = fuzz2(real_x, zk,"""
             , show antiAliasPasses
             , """) / f32(rendering_info.real_canvas_width);
-    pxs[ix] = px; //f32(real_x)/f32(rendering_info.real_canvas_width);
+    pxs[ix] = px;
     var py = 1. - fuzz2(real_y, zk, """
             , show antiAliasPasses
             , """) / f32(rendering_info.canvas_height);
-    pys[ix] = py; //f32(real_y)/f32(rendering_info.canvas_height);
+    pys[ix] = py;
     rays[ix].origin = origin;
     rays[ix].direction = lower_left_corner + vec3(px * ambitus_x, py * ambitus_y, 0.0);
-    triage_ixs[ix] = ix;
-    current_node[ix] = rendering_info.n_bvh_nodes - 1;
+    hits[ix] = 1000.f;
+    sphere_indices[ix] = 0u;
+    if (last_node.is_sphere == 1u) {
+      sphere_ixs[ix].pix = ix;
+      sphere_ixs[ix].vol = last_node_ix;
+    } else {
+      bvh_ixs[ix].pix = ix;
+      bvh_ixs[ix].vol = last_node_ix;
+    }
   }
   if (locxy == 0) {
-    atomicStore(&needs_triage, """
+    if (last_node.is_sphere == 1u) {
+      atomicStore(&needs_sphere, """
             , show totalPixels
             , """);
+    } else {
+      atomicStore(&needs_bvh, """
+            , show totalPixels
+            , """);
+    }
   }
   workgroupBarrier();
   for (var safe_cutoff: u32 = 0; safe_cutoff < 64u; safe_cutoff++) {
-    var currentTriage = atomicLoad(&needs_triage);
     var currentBVH = atomicLoad(&needs_bvh);
     var currentSphere = atomicLoad(&needs_sphere);
     workgroupBarrier();
-    var currentOpN = max(currentTriage, max(currentBVH, currentSphere));
+    var currentOpN = max(currentBVH, currentSphere);
     if (currentOpN != 0) {
-      var currentOp = select(select(2, 1, currentOpN == currentBVH), 0, currentOpN == currentTriage);
-      var currentOpNRemainder = select(0u, currentOpN - 64, currentOpN > 64);
-      currentOpN = min(64, currentOpN);
+      var currentOp = select(1, 0, currentOpN == currentBVH);
+      var currentOpNRemainder = select(0u, currentOpN - """
+            , show kernelSize
+            , """, currentOpN > """
+            , show kernelSize
+            , """);
+      currentOpN = min("""
+            , show kernelSize
+            , """, currentOpN);
       if (locxy < currentOpN) {
 
         switch currentOp {
           default: {}
           case 0: {
-            // clear triage
-            if (locxy == 0) {
-              atomicStore(&needs_triage, currentOpNRemainder);
-            }
-            // triage
-            var tloc = triage_ixs[locxy];
-            if (bvh_nodes[current_node[tloc]].is_sphere == 1u) {
-              var ix = atomicAdd(&needs_sphere, 1u);
-              sphere_ixs[ix] = tloc;
-            } else {
-              var ix = atomicAdd(&needs_bvh, 1u);
-              bvh_ixs[ix] = tloc;
-            }
-            // shift work down
-            if (locxy < currentOpNRemainder) {
-              for (var i: u32 = 64; i < """
-                , show (overcommit - 1)
-                , """; i += 64) {
-                  triage_ixs[i + locxy] = triage_ixs[i + locxy - 64];
-              }
-            }
-          }
-          case 1: {
-            // clear bvh
-            if (locxy == 0) {
-              atomicStore(&needs_bvh, currentOpNRemainder);
-            }
             // bvh
             var bloc = bvh_ixs[locxy];
-            var bitmask = bitmasks[bloc];
-            var bvh_stack = read_stack_at_bitmask(bitmask);
-            var not_left = !read_at_left(bitmask, bvh_stack);
-            var loop_completed = read_at_left(bitmask, bvh_stack) && read_at_right(bitmask, bvh_stack);
-            var stack_is_0 = bvh_stack == 0u;
-            var up_1_on_right = read_at_right(bitmask, bvh_stack - 1);
-            var up_1_on_left = !up_1_on_right;
-            var node = bvh_nodes[current_node[bloc]];
-            var ray = rays[bloc];
+            var node = bvh_nodes[bloc.vol];
+            var ray = rays[bloc.pix];
             var bbox: aabb;
             bvh_node_bounding_box(&node, &bbox);
             var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
             /////
-            var parent_node = node.parent;
-            current_node[bloc] =
-                select(
-                  select(
-                    // we're on the right branch, so focus on right
-                    node.right,
-                    // when completed focus on parent
-                    parent_node,
-                    loop_completed
-                  ),
-                  // if the box was hit, focus on the left node
-                  // otherwise focus on the parent
-                  select(
-                    parent_node,
-                    node.left,
-                    was_aabb_hit),
-                  not_left
-                );
-            // don't worry about underflow here as 0 checks are based on old value
-            // if we are ever below 0, one of the break checks below should trigger
-            var old_bvh_stack = bvh_stack;
-            bvh_stack =
-                select(
-                  select(
-                    // always increment on right as we've tested already
-                    old_bvh_stack + 1,
-                    // always go up a level if we've completed a loop
-                    old_bvh_stack - 1,
-                    loop_completed
-                  ),
-                  // increment if we have a hit, decrement if we don't
-                  select(old_bvh_stack - 1, old_bvh_stack + 1, was_aabb_hit),
-                  not_left
-                );
-            // always anchor left/right on old_bvh_stack
-            bitmask = write_at_left(bitmask, old_bvh_stack, select(
-                  select(
-                    true,
-                    false,
-                    loop_completed
-                  ),
-                  // if we haven't started the left yet, we only enter if aabb has been hit
-                  was_aabb_hit,
-                  not_left
-                ));
-            // always anchor left/right on old_bvh_stack
-            bitmask = write_at_right(bitmask, old_bvh_stack,
-                select(
-                  select(
-                    true,
-                    false,
-                    loop_completed
-                  ),
-                  false,
-                  not_left
-                ));
-            bitmask = write_stack_at_bitmask(bitmask, bvh_stack);
-            bitmasks[bloc] = bitmask;
-            if (!((stack_is_0 && !was_aabb_hit) || (stack_is_0 && loop_completed))) {
-              var ix = atomicAdd(&needs_triage, 1u);
-              triage_ixs[ix] = bloc;
-            }
-
-            // shift work down
-            if (locxy < currentOpNRemainder) {
-              for (var i: u32 = 64; i < """
-                , show (overcommit - 1)
-                , """; i += 64) {
-                  bvh_ixs[i + locxy] = triage_ixs[i + locxy - 64];
+            if (was_aabb_hit) {
+              if (bvh_nodes[node.left].is_sphere == 1u) {
+                var ix = atomicAdd(&needs_sphere, 1u);
+                sphere_ixs[ix].pix = bloc.pix;
+                sphere_ixs[ix].vol = node.left;
+              } else {
+                var ix = atomicAdd(&needs_bvh, 1u);
+                bvh_ixs[ix].pix = bloc.pix;
+                bvh_ixs[ix].vol = node.left;
+              }
+              if (bvh_nodes[node.right].is_sphere == 1u) {
+                var ix = atomicAdd(&needs_sphere, 1u);
+                sphere_ixs[ix].pix = bloc.pix;
+                sphere_ixs[ix].vol = node.right;
+              } else {
+                var ix = atomicAdd(&needs_bvh, 1u);
+                bvh_ixs[ix].pix = bloc.pix;
+                bvh_ixs[ix].vol = node.right;
               }
             }
           }
-          case 2: {
-            if (locxy == 0) {
-              atomicStore(&needs_sphere, currentOpNRemainder);
-            }
+          case 1: {
             // sphere
             var sloc = sphere_ixs[locxy];
-            var bitmask = bitmasks[sloc];
-            var bvh_stack = read_stack_at_bitmask(bitmask);
-            var stack_is_0 = bvh_stack == 0u;
-            var node = bvh_nodes[current_node[sloc]];
-            var ray = rays[sloc];
+            var node = bvh_nodes[sloc.vol];
+            var ray = rays[sloc.pix];
             var hit_t: f32;
             var sphere_ix = node.left * 4u;
             var sphere_hit = hit_sphere(
@@ -914,33 +799,50 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
               t_max,
               &hit_t);
             var i_plus_1 = node.left + 1u;
-            var old_t = hits[sloc];
-            hits[sloc] =
-                select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
+            var old_t = hits[sloc.pix];
+            var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
+            hits[sloc.pix] = new_t;
             ///
-            var old_ix = sphere_indices[sloc];
-            sphere_indices[sloc] =
-              select(old_ix, select(old_ix, i_plus_1, hit_t != old_t), sphere_hit);
-            var parent_node = node.parent;
-            current_node[sloc] = parent_node;
-            var old_bvh_stack = bvh_stack;
-            bvh_stack = old_bvh_stack - 1;
-            bitmask = write_at_left(bitmask, old_bvh_stack, false);
-            bitmask = write_at_right(bitmask, old_bvh_stack, false);
-            bitmask = write_stack_at_bitmask(bitmask, bvh_stack);
-
-            if (!stack_is_0) {
-              var ix = atomicAdd(&needs_triage, 1u);
-              triage_ixs[ix] = sloc;
-            }
-            // shift work down
-            if (locxy < currentOpNRemainder) {
-              for (var i: u32 = 64; i < """
-                , show (overcommit - 1)
-                , """; i += 64) {
-                  sphere_ixs[i + locxy] = triage_ixs[i + locxy - 64];
+            var old_ix = sphere_indices[sloc.pix];
+            sphere_indices[sloc.pix] =
+              select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
+          }
+        }
+      }
+      switch currentOp {
+        default: {}
+        case 0: {
+          // shift work down
+          // clear bvh
+          if (locxy == 0) {
+            atomicStore(&needs_bvh, currentOpNRemainder);
+          }
+          for (var i: u32 = """
+        , show 0
+        , """; i < """
+        , show totalPixels
+        , """; i += """
+        , show kernelSize
+        , """) {
+              if (i + locxy + currentOpN < """, show totalPixels, """) {              
+                bvh_ixs[i + locxy] = bvh_ixs[i + locxy + currentOpN];
               }
-            }
+          }
+        }
+        case 1: {
+          if (locxy == 0) {
+            atomicStore(&needs_sphere, currentOpNRemainder);
+          }
+          for (var i: u32 = """
+        , show 0
+        , """; i < """
+        , show totalPixels
+        , """; i += """
+        , show kernelSize
+        , """) {
+              if (i + locxy + currentOpN < """, show totalPixels, """) {              
+                sphere_ixs[i + locxy] = sphere_ixs[i + locxy + currentOpN];
+              }
           }
         }
       }
@@ -948,17 +850,20 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     workgroupBarrier();
   }
   for (var i: u32 = 0; i < """
-            , show overcommit
-            , """; i += 64) {
+            , show totalPixels
+            , """; i += """
+            , show kernelSize
+            , """) {
     var ix = locxy + i;
     var hit = hits[ix];
+    var sphere_idx = sphere_indices[ix];
     var ray_of_light = rays[ix];
-    var was_i_hit = false; // hit > 0;
+    var was_i_hit = sphere_idx > 0u;
     var my_color = vec3(0.0,0.0,0.0);
     if (!was_i_hit) {
       my_color = sky_color(&ray_of_light);
     } else {
-      var sphere_idx = sphere_indices[ix] - 1;
+      sphere_idx = sphere_idx - 1;
       var sphere_offset = sphere_idx * 4;
       var norm_t = hit;
       var rec: hit_record;
@@ -967,29 +872,49 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     }
     colors[ix] = my_color;
   }
+  workgroupBarrier();
 
-  // this last bit only needs to be done for the 4x4 grid
-  if (locxy >= 16) {
+  // this last bit only needs to be done for the square grid
+  if (locxy >= """
+            , show squareArea
+            , """) {
     return;
   }
   var bbb = 0.0;
   var ggg = 0.0; 
   var rrr = 0.0;
   for (var i: u32 = 0; i < """
-            , show antiAliasPasses
-            , """; i += 16) {
+            , show totalPixels
+            , """; i += """
+            , show squareArea
+            , """) {
     var my_color = colors[locxy + i];
     bbb += (my_color.b / aa_f32);
     ggg += (my_color.g / aa_f32);
     rrr += (my_color.r / aa_f32);
   }
-  var xk = locxy % 4;
-  var yk = (locxy / 4) % 4;
-  var real_x = (global_id.x / 4 ) + xk; // (_ * 4 / 16)
-  var real_y = (global_id.y) + yk; // (_ * 4 / 4)
+
+  var xk = locxy % """
+            , show squareSide
+            , """;
+  var yk = (locxy / """
+            , show squareSide
+            , """) % """
+            , show squareSide
+            , """;
+  var real_x = (global_id.x / """
+            , show kernelX
+            , """ ) * """
+            , show squareSide
+            , """ + xk;
+  var real_y = (global_id.y / """
+            , show kernelY
+            , """) * """
+            , show squareSide
+            , """ + yk;
   var overshot_idx = real_x + (real_y * rendering_info.overshot_canvas_width);
   result_array[overshot_idx] = pack4x8unorm(vec4(bbb, ggg, rrr, 1.f));
-  //result_array[overshot_idx] = pack4x8unorm(vec4(1.f, 0.f, 0.f, 1.f));
+  //result_array[overshot_idx] = pack4x8unorm(vec4(1.f, 0.3f, 0.7f, 1.f));
 }
 """
             ]
@@ -1073,10 +998,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     let
       encodeCommands colorTexture = do
         -- whichLoop <- Ref.modify (_ + 1) loopN
-        cw <- clientWidth (toElement canvas)
-        ch <- clientHeight (toElement canvas)
-        setWidth (floor cw) canvas
-        setHeight (floor ch) canvas
         canvasWidth <- width canvas
         canvasHeight <- height canvas
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
@@ -1142,6 +1063,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
             pushFrameInfo { avgTime, avgFrame }
     let
       render = unit # fix \f _ -> do
+        cw <- clientWidth (toElement canvas)
+        ch <- clientHeight (toElement canvas)
+        setWidth (floor cw) canvas
+        setHeight (floor ch) canvas
         colorTexture <- getCurrentTexture context
         encodeCommands colorTexture
         window >>= void <<< requestAnimationFrame (f unit)
