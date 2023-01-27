@@ -29,7 +29,6 @@ import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
-import Debug (spy)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (id_, klass_)
 import Deku.Control (text, text_, (<#~>))
@@ -210,7 +209,7 @@ antiAliasFuzzing =
   """
 const fuzz_fac = 0.75;
 const half_fuzz_fac = fuzz_fac / 2.0;
-fn fuzz2(i: u32, n: u32, d: u32) -> f32
+fn fuzzMe(i: u32, n: u32, d: u32) -> f32
 {
     var fi = f32(i);
     // we stagger things to take advantage of the fact that the first pass has been done already
@@ -218,7 +217,7 @@ fn fuzz2(i: u32, n: u32, d: u32) -> f32
     var fd = f32((2*d));
     return fi + ((fnn / fd) * fuzz_fac) - half_fuzz_fac;
 }
-fn fuzz3(i: u32, n: u32, d: u32) -> f32
+fn noFuzz(i: u32, n: u32, d: u32) -> f32
 {
     var fi = f32(i);
     return fi;
@@ -444,12 +443,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   ////////////////////////////////////////
   var last_node = bvh_nodes[last_node_ix];
   px = """
-  , if aaP == 1 then "fuzz3" else "fuzz2"
+  , if aaP == 1 then "noFuzz" else "fuzzMe"
   , """(real_x,aa_pass,"""
   , show aaP
   , """) / f32(rendering_info.real_canvas_width);
   py = 1. - ("""
-  , if aaP == 1 then "fuzz3" else "fuzz2"
+  , if aaP == 1 then "noFuzz" else "fuzzMe"
   , """(real_y,aa_pass,"""
   , show aaP
   , """) / f32(rendering_info.canvas_height));
@@ -828,7 +827,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
+    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -1005,7 +1004,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     let
       antiAliasDesc = x
-        { code: spy "text" $ fold
+        { code: fold
             [ lerp
             , lerpv
             , inputData
