@@ -88,7 +88,7 @@ kernelY :: Int
 kernelY = 4
 
 squareSide :: Int
-squareSide = 4
+squareSide = 2
 
 squareArea = squareSide * squareSide :: Int
 
@@ -96,13 +96,12 @@ kernelSize :: Int
 kernelSize = kernelX * kernelY
 
 antiAliasPasses :: Int
-antiAliasPasses = 8
+antiAliasPasses = 4
 
 totalPixels :: Int
 totalPixels = squareArea * antiAliasPasses
 
-maxingOutMemory = 4 :: Int
-arrLength = totalPixels * maxingOutMemory :: Int
+arrLength = 512 :: Int
 
 overcommit :: Int
 overcommit = totalPixels / kernelSize
@@ -546,7 +545,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 16 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
+    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: 0.25, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -748,18 +747,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   }
   var bvh_playhead = 0u;
   var sphere_playhead = 0u;
-  for (var safe_cutoff: u32 = 0; safe_cutoff < 128u; safe_cutoff++) {
-    workgroupBarrier();
-    var currentSphereWrite = atomicLoad(&sphere_write_playhead);
-    var currentBVHWrite = atomicLoad(&bvh_write_playhead);
-    var currentSphereRead = sphere_read_playhead;
-    var currentBVHRead = bvh_read_playhead;
-    var currentBVH = currentBVHWrite - currentBVHRead;
-    var currentSphere = currentSphereWrite - currentSphereRead;
-    workgroupBarrier();
-    var currentOpN = max(currentBVH, currentSphere);
-    var currentOp = select(1, 0, currentOpN == currentBVH);
-    if (currentOpN != 0) {
+  var currentSphereWrite = atomicLoad(&sphere_write_playhead);
+  var currentBVHWrite = atomicLoad(&bvh_write_playhead);
+  var currentSphereRead = sphere_read_playhead;
+  var currentBVHRead = bvh_read_playhead;
+  var currentBVH = currentBVHWrite - currentBVHRead;
+  var currentSphere = currentSphereWrite - currentSphereRead;
+  var currentOpN = max(currentBVH, currentSphere);
+  var currentOp = select(1, 0, currentOpN == currentBVH);
+  workgroupBarrier();
+  var is_done = false;
+  for (var safe_cutoff: u32 = 0; safe_cutoff < 512u; safe_cutoff++) {
+    if (!is_done) {
       currentOpN = min("""
             , show kernelSize
             , """, currentOpN);
@@ -836,7 +835,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
       }
     }
     workgroupBarrier();
-    if (currentOpN != 0) {
+    if (!is_done) {
       switch currentOp {
         default: {}
         case 0: {
@@ -850,6 +849,18 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
           }
         }
       }
+    }
+    workgroupBarrier();
+    if (!is_done) {
+      currentSphereWrite = atomicLoad(&sphere_write_playhead);
+      currentBVHWrite = atomicLoad(&bvh_write_playhead);
+      currentSphereRead = sphere_read_playhead;
+      currentBVHRead = bvh_read_playhead;
+      currentBVH = currentBVHWrite - currentBVHRead;
+      currentSphere = currentSphereWrite - currentSphereRead;
+      currentOpN = max(currentBVH, currentSphere);
+      currentOp = select(1, 0, currentOpN == currentBVH);
+      is_done = currentOpN == 0u;
     }
   }
   for (var i: u32 = 0; i < """
