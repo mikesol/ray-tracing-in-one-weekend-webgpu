@@ -29,7 +29,6 @@ import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
-import Debug (spy)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (id_, klass_)
 import Deku.Control (text, text_, (<#~>))
@@ -210,7 +209,7 @@ antiAliasFuzzing =
   """
 const fuzz_fac = 0.75;
 const half_fuzz_fac = fuzz_fac / 2.0;
-fn fuzz2(i: u32, n: u32, d: u32) -> f32
+fn fuzzMe(i: u32, n: u32, d: u32) -> f32
 {
     var fi = f32(i);
     // we stagger things to take advantage of the fact that the first pass has been done already
@@ -218,7 +217,7 @@ fn fuzz2(i: u32, n: u32, d: u32) -> f32
     var fd = f32((2*d));
     return fi + ((fnn / fd) * fuzz_fac) - half_fuzz_fac;
 }
-fn fuzz3(i: u32, n: u32, d: u32) -> f32
+fn noFuzz(i: u32, n: u32, d: u32) -> f32
 {
     var fi = f32(i);
     return fi;
@@ -315,7 +314,6 @@ fn make_hit_rec(cx: f32, cy: f32, cz: f32, radius: f32, t: f32, r: ptr<function,
 usefulConsts :: String
 usefulConsts =
   """
-const color_mult = 1 << 8;
 const origin = vec3(0.0, 0.0, 0.0);
       """
 
@@ -444,12 +442,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   ////////////////////////////////////////
   var last_node = bvh_nodes[last_node_ix];
   px = """
-  , if aaP == 1 then "fuzz3" else "fuzz2"
+  , if aaP == 1 then "noFuzz" else "fuzzMe"
   , """(real_x,aa_pass,"""
   , show aaP
   , """) / f32(rendering_info.real_canvas_width);
   py = 1. - ("""
-  , if aaP == 1 then "fuzz3" else "fuzz2"
+  , if aaP == 1 then "noFuzz" else "fuzzMe"
   , """(real_y,aa_pass,"""
   , show aaP
   , """) / f32(rendering_info.canvas_height));
@@ -1005,7 +1003,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     let
       antiAliasDesc = x
-        { code: spy "text" $ fold
+        { code: fold
             [ lerp
             , lerpv
             , inputData
@@ -1230,7 +1228,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        -- clear colors as they're subject to an atomic operation
+        -- clear buffers
         GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wCanvasBindGroup
@@ -1243,7 +1241,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setPipeline computePassEncoder resetContrastBufferPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
         ------------------------
-        -- do bvh, color mapping and anti-aliasing
+        -- do main compute
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wCanvasBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
@@ -1251,6 +1249,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
         -----------------------------------
         -----------------------------------
+        -- calculate contrast
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           contrastBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
@@ -1258,6 +1257,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder contrastX contrastY 1
         -----------------------------------
         -----------------------------------
+        -- do anti-aliasing on high contrast areas
+        -- the indirect buffer is capped at 0xffff
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           rContrastIxsBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
@@ -1270,6 +1271,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
           (x { texture: colorTexture })
           (gpuExtent3DWH canvasWidth canvasHeight)
+        -- for debugging, which is useful when working with complex setups like this!
         -- copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
