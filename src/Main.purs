@@ -101,7 +101,7 @@ antiAliasPasses = 1
 totalPixels :: Int
 totalPixels = squareArea * antiAliasPasses
 
-arrLength = 512 :: Int
+arrLength = 64 :: Int
 
 overcommit :: Int
 overcommit = totalPixels / kernelSize
@@ -550,7 +550,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
           ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-            ] <> randos
+            ]  <> randos
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
@@ -619,47 +619,6 @@ fn sky_color(r: ptr<function,ray>) -> vec3<f32> {
 
 // main
 
-fn pix_from_pixvol(pixvol: u32) -> u32 {
-  return pixvol & 0xffff;
-}
-
-fn vol_from_pixvol(pixvol: u32) -> u32 {
-  return pixvol >> 16;
-}
-
-fn pix_and_vol_to_pixvol(pix: u32, vol: u32) -> u32 {
-  return pix | (vol << 16);
-}
-
-var<workgroup> pxs: array<f32, """
-            , show totalPixels
-            , """>;
-var<workgroup> pys: array<f32, """
-            , show totalPixels
-            , """>;
-var<workgroup> rays: array<ray, """
-            , show totalPixels
-            , """>;
-var<workgroup> hits: array<f32, """
-            , show totalPixels
-            , """>;
-var<workgroup> colors: array<vec3<f32>, """
-            , show totalPixels
-            , """>;
-var<workgroup> sphere_indices: array<u32, """
-            , show totalPixels
-            , """>;
-var<workgroup> bvh_read_playhead: u32;
-var<workgroup> bvh_write_playhead: atomic<u32>;
-var<workgroup> sphere_read_playhead: u32;
-var<workgroup> sphere_write_playhead: atomic<u32>;
-var<workgroup> bvh_ixs: array<u32, """
-            , show (arrLength)
-            , """>;
-var<workgroup> sphere_ixs: array<u32, """
-            , show (arrLength)
-            , """>;
-
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_nodes : array<bvh_node>;
@@ -670,9 +629,27 @@ var<workgroup> sphere_ixs: array<u32, """
             , show kernelY
             , """, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
-  var aa_f32 = f32("""
-            , show antiAliasPasses
-            , """);
+  ////////////////////////////////////////
+  ////////////////////////////////////////
+  var px: f32;
+  var py: f32;
+  var ray: ray;
+  var hit: f32;
+  var color: vec3<f32>;
+  var sphere_ix: u32;
+  var bvh_read_playhead: u32;
+  var bvh_write_playhead: u32;
+  var sphere_read_playhead: u32;
+  var sphere_write_playhead: u32;
+  var bvh_ixs: array<u32, """
+              , show (arrLength)
+              , """>;
+  var sphere_ixs: array<u32, """
+              , show (arrLength)
+              , """>;
+
+  ////////////////////////////////////////
+  ////////////////////////////////////////
   var cwch = rendering_info.real_canvas_width * rendering_info.canvas_height;
   var aspect = f32(rendering_info.real_canvas_width) / f32(rendering_info.canvas_height);
   var ambitus_x = select(2.0 * aspect, 2.0, aspect < 1.0);
@@ -686,249 +663,143 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var locxy = locy + local_id.x;
   var last_node_ix = rendering_info.n_bvh_nodes - 1;
   var last_node = bvh_nodes[last_node_ix];
-  for (var i: u32 = 0; i < """
-            , show totalPixels
-            , """;  i += """
-            , show kernelSize
-            , """) {
-    var ix = locxy + i;
-    var xk = ix % """
-            , show squareSide
-            , """;
-    var yk = (ix / """
-            , show squareSide
-            , """) % """
-            , show squareSide
-            , """;
-    var zk = ix / """
-            , show squareArea
-            , """;
-    var real_x = (global_id.x / """
-            , show kernelX
-            , """ ) * """
-            , show squareSide
-            , """ + xk;
-    var real_y = (global_id.y / """
-            , show kernelY
-            , """) * """
-            , show squareSide
-            , """ + yk;
-    var px = fuzz2(real_x, zk,"""
-            , show antiAliasPasses
-            , """) / f32(rendering_info.real_canvas_width);
-    pxs[ix] = px;
-    var py = 1. - fuzz2(real_y, zk, """
-            , show antiAliasPasses
-            , """) / f32(rendering_info.canvas_height);
-    pys[ix] = py;
-    rays[ix].origin = origin;
-    rays[ix].direction = lower_left_corner + vec3(px * ambitus_x, py * ambitus_y, 0.0);
-    hits[ix] = 1000.f;
-    sphere_indices[ix] = 0u;
-    var last_node_pixvol = pix_and_vol_to_pixvol(ix, last_node_ix);
-    if (last_node.is_sphere == 1u) {
-      sphere_ixs[ix] = last_node_pixvol;
-    } else {
-      bvh_ixs[ix] = last_node_pixvol;
-    }
+  var xk = locxy % """
+          , show squareSide
+          , """;
+  var yk = (locxy / """
+          , show squareSide
+          , """) % """
+          , show squareSide
+          , """;
+  var zk = locxy / """
+          , show squareArea
+          , """;
+  var real_x = (global_id.x / """
+          , show kernelX
+          , """ ) * """
+          , show squareSide
+          , """ + xk;
+  var real_y = (global_id.y / """
+          , show kernelY
+          , """) * """
+          , show squareSide
+          , """ + yk;
+  px = f32(real_x) / f32(rendering_info.real_canvas_width);
+  py = 1. - (f32(real_y) / f32(rendering_info.canvas_height));
+  ray.origin = origin;
+  ray.direction = lower_left_corner + vec3(px * ambitus_x, py * ambitus_y, 0.0);
+  hit = 1000.f;
+  sphere_ix = 0u;
+  if (last_node.is_sphere == 1u) {
+    sphere_ixs[0] = last_node_ix;
+    sphere_write_playhead = 1u;
+  } else {
+    bvh_ixs[0] = last_node_ix;
+    bvh_write_playhead = 1u;
   }
-  if (locxy == 0) {
-    if (last_node.is_sphere == 1u) {
-      atomicStore(&sphere_write_playhead, """
-            , show totalPixels
-            , """);
-    } else {
-      atomicStore(&bvh_write_playhead, """
-            , show totalPixels
-            , """);
-    }
-    sphere_read_playhead = 0u;
-    bvh_read_playhead = 0u;
-  }
-  var bvh_playhead = 0u;
-  var sphere_playhead = 0u;
-  var currentSphereWrite = atomicLoad(&sphere_write_playhead);
-  var currentBVHWrite = atomicLoad(&bvh_write_playhead);
-  var currentSphereRead = sphere_read_playhead;
-  var currentBVHRead = bvh_read_playhead;
-  var currentBVH = currentBVHWrite - currentBVHRead;
-  var currentSphere = currentSphereWrite - currentSphereRead;
-  var currentOpN = max(currentBVH, currentSphere);
-  var currentOp = select(1, 0, currentOpN == currentBVH);
-  workgroupBarrier();
+  sphere_read_playhead = 0u;
+  bvh_read_playhead = 0u;
+  var currentBVH = bvh_write_playhead - bvh_read_playhead;
+  var currentSphere = sphere_write_playhead - sphere_read_playhead;
   var is_done = false;
-  for (var safe_cutoff: u32 = 0; safe_cutoff < 512u; safe_cutoff++) {
-    if (!is_done) {
-      currentOpN = min("""
-            , show kernelSize
-            , """, currentOpN);
-      if (locxy < currentOpN) {
+  loop {
+    if (is_done) {
+      break;
+    }
+    var starting_bvh_write_playhead = bvh_write_playhead;
+    var starting_sphere_write_playhead = sphere_write_playhead;
+    // bvh
+    if (starting_bvh_write_playhead > bvh_read_playhead) {
+      var bloc = bvh_ixs[bvh_read_playhead % """
+      , show (arrLength)
+      , """];
+      var node = bvh_nodes[bloc];
+      var bbox: aabb;
+      bvh_node_bounding_box(&node, &bbox);
+      var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
+      /////
+      if (was_aabb_hit) {
+        if (bvh_nodes[node.left].is_sphere == 1u) {
+          sphere_ixs[sphere_write_playhead % """
+      , show (arrLength)
+      , """] = node.left;
+          sphere_write_playhead++;
+        } else {
+          bvh_ixs[(bvh_write_playhead) % """
+      , show (arrLength)
+      , """] = node.left;
+          bvh_write_playhead++;
+        }
+        if (bvh_nodes[node.right].is_sphere == 1u) {
+          sphere_ixs[(sphere_write_playhead) % """
+      , show (arrLength)
+      , """] = node.right;
+          sphere_write_playhead++;
+        } else {
+          bvh_ixs[(bvh_write_playhead) % """
+      , show (arrLength)
+      , """] = node.right;
+          bvh_write_playhead++;
+        }
+      }
+    }
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    if (starting_sphere_write_playhead > sphere_read_playhead) {
+      // sphere
+      var sloc = sphere_ixs[(sphere_read_playhead) % """
+      , show (arrLength)
+      , """];
+      var node = bvh_nodes[sloc];
+      var hit_t: f32;
+      var sphere_test = node.left * 4u;
+      var sphere_hit = hit_sphere(
+        sphere_info[sphere_test],
+        sphere_info[sphere_test+1],
+        sphere_info[sphere_test+2],
+        sphere_info[sphere_test+3],
+        &ray,
+        t_min,
+        t_max,
+        &hit_t);
+      var i_plus_1 = node.left + 1u;
+      var old_t = hit;
+      var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
+      hit = new_t;
+      ///
+      var old_ix = sphere_ix;
+      sphere_ix =
+        select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
+    }
+    if (starting_bvh_write_playhead > bvh_read_playhead) {
+        bvh_read_playhead += 1;
+    }
+    if (starting_sphere_write_playhead > sphere_read_playhead) {
+        sphere_read_playhead += 1;
+    }
+    is_done = (sphere_write_playhead == sphere_read_playhead) && (bvh_write_playhead == bvh_read_playhead);
+  }
 
-        switch currentOp {
-          default: {}
-          case 0: {
-            // bvh
-            var bloc = bvh_ixs[(locxy + currentBVHRead) % """
-            , show (arrLength)
-            , """];
-            var bloc_pix = pix_from_pixvol(bloc);
-            var node = bvh_nodes[vol_from_pixvol(bloc)];
-            var ray = rays[bloc_pix];
-            var bbox: aabb;
-            bvh_node_bounding_box(&node, &bbox);
-            var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
-            /////
-            if (was_aabb_hit) {
-              if (bvh_nodes[node.left].is_sphere == 1u) {
-                var ix = atomicAdd(&sphere_write_playhead, 1u);
-                sphere_ixs[(ix) % """
-            , show (arrLength)
-            , """] = pix_and_vol_to_pixvol(bloc_pix, node.left);
-              } else {
-                var ix = atomicAdd(&bvh_write_playhead, 1u);
-                bvh_ixs[(ix) % """
-            , show (arrLength)
-            , """] = pix_and_vol_to_pixvol(bloc_pix, node.left);
-              }
-              if (bvh_nodes[node.right].is_sphere == 1u) {
-                var ix = atomicAdd(&sphere_write_playhead, 1u);
-                sphere_ixs[(ix) % """
-            , show (arrLength)
-            , """] = pix_and_vol_to_pixvol(bloc_pix, node.right);
-              } else {
-                var ix = atomicAdd(&bvh_write_playhead, 1u);
-                bvh_ixs[(ix) % """
-            , show (arrLength)
-            , """] = pix_and_vol_to_pixvol(bloc_pix, node.right);
-              }
-            }
-          }
-          case 1: {
-            // sphere
-            var sloc = sphere_ixs[(locxy + currentSphereRead) % """
-            , show (arrLength)
-            , """];
-            var node = bvh_nodes[vol_from_pixvol(sloc)];
-            var sloc_pix = pix_from_pixvol(sloc);
-            var ray = rays[sloc_pix];
-            var hit_t: f32;
-            var sphere_ix = node.left * 4u;
-            var sphere_hit = hit_sphere(
-              sphere_info[sphere_ix],
-              sphere_info[sphere_ix+1],
-              sphere_info[sphere_ix+2],
-              sphere_info[sphere_ix+3],
-              &ray,
-              t_min,
-              t_max,
-              &hit_t);
-            var i_plus_1 = node.left + 1u;
-            var old_t = hits[sloc_pix];
-            var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
-            hits[sloc_pix] = new_t;
-            ///
-            var old_ix = sphere_indices[sloc_pix];
-            sphere_indices[sloc_pix] =
-              select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
-          }
-        }
-      }
-    }
-    workgroupBarrier();
-    if (!is_done) {
-      switch currentOp {
-        default: {}
-        case 0: {
-          if (locxy == 0) {
-            bvh_read_playhead += currentOpN;
-          }
-        }
-        case 1: {
-          if (locxy == 0) {
-            sphere_read_playhead += currentOpN;
-          }
-        }
-      }
-    }
-    workgroupBarrier();
-    if (!is_done) {
-      currentSphereWrite = atomicLoad(&sphere_write_playhead);
-      currentBVHWrite = atomicLoad(&bvh_write_playhead);
-      currentSphereRead = sphere_read_playhead;
-      currentBVHRead = bvh_read_playhead;
-      currentBVH = currentBVHWrite - currentBVHRead;
-      currentSphere = currentSphereWrite - currentSphereRead;
-      currentOpN = max(currentBVH, currentSphere);
-      currentOp = select(1, 0, currentOpN == currentBVH);
-      is_done = currentOpN == 0u;
-    }
+  var was_i_hit = sphere_ix > 0u;
+  var my_color = vec3(0.0,0.0,0.0);
+  if (!was_i_hit) {
+    my_color = sky_color(&ray);
+  } else {
+    sphere_ix = sphere_ix - 1;
+    var sphere_offset = sphere_ix * 4;
+    var norm_t = hit;
+    var rec: hit_record;
+    _ = make_hit_rec(sphere_info[sphere_offset], sphere_info[sphere_offset + 1], sphere_info[sphere_offset + 2], sphere_info[sphere_offset + 3], norm_t, &ray, &rec);
+    my_color = hit_color(&ray, &rec);
   }
-  for (var i: u32 = 0; i < """
-            , show totalPixels
-            , """; i += """
-            , show kernelSize
-            , """) {
-    var ix = locxy + i;
-    var hit = hits[ix];
-    var sphere_idx = sphere_indices[ix];
-    var ray_of_light = rays[ix];
-    var was_i_hit = sphere_idx > 0u;
-    var my_color = vec3(0.0,0.0,0.0);
-    if (!was_i_hit) {
-      my_color = sky_color(&ray_of_light);
-    } else {
-      sphere_idx = sphere_idx - 1;
-      var sphere_offset = sphere_idx * 4;
-      var norm_t = hit;
-      var rec: hit_record;
-      _ = make_hit_rec(sphere_info[sphere_offset], sphere_info[sphere_offset + 1], sphere_info[sphere_offset + 2], sphere_info[sphere_offset + 3], norm_t, &ray_of_light, &rec);
-      my_color = hit_color(&ray_of_light, &rec);
-    }
-    colors[ix] = my_color;
-  }
-  workgroupBarrier();
 
   // this last bit only needs to be done for the square grid
-  if (locxy >= """
-            , show squareArea
-            , """) {
-    return;
-  }
-  var bbb = 0.0;
-  var ggg = 0.0; 
-  var rrr = 0.0;
-  for (var i: u32 = 0; i < """
-            , show totalPixels
-            , """; i += """
-            , show squareArea
-            , """) {
-    var my_color = colors[locxy + i];
-    bbb += (my_color.b / aa_f32);
-    ggg += (my_color.g / aa_f32);
-    rrr += (my_color.r / aa_f32);
-  }
 
-  var xk = locxy % """
-            , show squareSide
-            , """;
-  var yk = (locxy / """
-            , show squareSide
-            , """) % """
-            , show squareSide
-            , """;
-  var real_x = (global_id.x / """
-            , show kernelX
-            , """ ) * """
-            , show squareSide
-            , """ + xk;
-  var real_y = (global_id.y / """
-            , show kernelY
-            , """) * """
-            , show squareSide
-            , """ + yk;
   var overshot_idx = real_x + (real_y * rendering_info.overshot_canvas_width);
-  result_array[overshot_idx] = pack4x8unorm(vec4(bbb, ggg, rrr, 1.f));
-  //result_array[overshot_idx] = pack4x8unorm(vec4(1.f, 0.3f, 0.7f, 1.f));
+  result_array[overshot_idx] = pack4x8unorm(vec4(my_color.b, my_color.g, my_color.r, 1.f));
 }
 """
             ]
