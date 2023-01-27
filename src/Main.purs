@@ -88,7 +88,7 @@ kernelY :: Int
 kernelY = 4
 
 squareSide :: Int
-squareSide = 2
+squareSide = 8
 
 squareArea = squareSide * squareSide :: Int
 
@@ -96,7 +96,7 @@ kernelSize :: Int
 kernelSize = kernelX * kernelY
 
 antiAliasPasses :: Int
-antiAliasPasses = 4
+antiAliasPasses = 1
 
 totalPixels :: Int
 totalPixels = squareArea * antiAliasPasses
