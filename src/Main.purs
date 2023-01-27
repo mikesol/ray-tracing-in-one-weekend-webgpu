@@ -742,6 +742,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
           bvh_write_playhead++;
         }
       }
+      bvh_read_playhead += 1; 
     }
     //////////////////////////////////////////////////////
     //////////////////////////////////////////////////////
@@ -766,19 +767,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
         t_max,
         &hit_t);
       var i_plus_1 = node.left + 1u;
-      var old_t = hit;
+      var old_t = hit; 
       var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
       hit = new_t;
       ///
       var old_ix = sphere_ix;
       sphere_ix =
         select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
-    }
-    if (starting_bvh_write_playhead > bvh_read_playhead) {
-        bvh_read_playhead += 1;
-    }
-    if (starting_sphere_write_playhead > sphere_read_playhead) {
-        sphere_read_playhead += 1;
+      sphere_read_playhead += 1;
     }
     is_done = (sphere_write_playhead == sphere_read_playhead) && (bvh_write_playhead == bvh_read_playhead);
   }
