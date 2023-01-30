@@ -1347,7 +1347,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 64 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
+    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -1361,7 +1361,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
     let nSpheres = NEA.length spheres
     let nBVHNodes = NEA.length bvhNodes
-    let bvhDepth = ((unsignedLog2 nSpheres) / 2) + 1
+    let bvhDepth = unsignedLog2 nSpheres
     logShow {bvhDepth}
     sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
     sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
@@ -1443,7 +1443,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , counterDefs
               , ray
               , aabb
-              , bvhComputeShader0 { even: true }
+              , bvhComputeShader { even: true }
               ]
         , label: "bvhEven"
         }
@@ -1466,7 +1466,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , counterDefs
               , ray
               , aabb
-              , bvhComputeShader0 { even: false }
+              , bvhComputeShader { even: false }
               ]
         , label: "bvhOdd"
         }
@@ -2348,7 +2348,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
-        let debugCondition = true -- whichLoop == 100
+        let debugCondition = false -- whichLoop == 100
         launchAff_ do
           toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
           liftEffect do
@@ -2371,7 +2371,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         colorTexture <- getCurrentTexture context
         encodeCommands colorTexture
         -- uncomment when debugged 
-        -- window >>= void <<< requestAnimationFrame (f unit)
+        window >>= void <<< requestAnimationFrame (f unit)
 
     liftEffect render
 
