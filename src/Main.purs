@@ -1007,7 +1007,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
     queue <- liftEffect $ GPUDevice.queue device
     deviceLimits <- liftEffect $ limits device
     canvasInfoBuffer <- liftEffect $ createBuffer device $ x
-      { size: 28 -- align(4) size(28)
+      { size: 52 -- align(4) size(52)
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
       }
     -- debugBuffer <- liftEffect $ createBuffer device $ x
