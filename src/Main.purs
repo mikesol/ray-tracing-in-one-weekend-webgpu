@@ -440,9 +440,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var base_lookup = current_grid * 64;
   var place_in_64 = lookup - base_lookup;
   var cg8 = current_grid * 8;
-  var running_index = (cg8 % rendering_info.real_canvas_width) + (place_in_64 % 8);
-  var current_grid_x = (running_index) % rendering_info.real_canvas_width;
-  var current_grid_y = ((cg8 / rendering_info.real_canvas_width) + select(0u, 1u, running_index != current_grid_x)) * 8 + (place_in_64 / 8);
+  var running_index = cg8 + (place_in_64 % 8);
+  var current_grid_x = running_index % rendering_info.real_canvas_width;
+  var current_grid_y = (running_index / rendering_info.real_canvas_width) * 8 + (place_in_64 / 8);
   var px = fuzzable(current_grid_x, 0) / f32(rendering_info.real_canvas_width);
   var py = 1. - fuzzable(current_grid_y, 0) / f32(rendering_info.canvas_height);
   var r: ray;
@@ -653,13 +653,19 @@ assembleRawColorsShader =
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var idx = global_id.x + (global_id.y * rendering_info.real_canvas_width);
-  if (idx >= rendering_info.cwch) {
-    return;
-  }
+  //if (idx >= rendering_info.cwch) {
+  //  return;
+  //}
   var overshot_idx = global_id.x + (global_id.y * rendering_info.overshot_canvas_width);
   var rc = raw_color_arary[idx];
   // random test for anti-aliasing, should work...
-  if (rc.b1 == 1.f && rc.g2 == 1.f && rc.r3 == 1.f) {
+
+  if (rc.g0 == 1.f) {
+    color_arary[overshot_idx] = pack4x8unorm(vec4(
+        1.f,0.f,0.f,
+        1.f));
+  }
+  else if (rc.b1 == 1.f && rc.g2 == 1.f && rc.r3 == 1.f) {
       color_arary[overshot_idx] = pack4x8unorm(vec4(
         rc.b0,
         rc.g0,
@@ -810,6 +816,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   }
 }
 """
+
+eightify :: Int -> Int
+eightify i = if x == i then i else x + 8
+  where
+  x = (i / 8) * 8
 
 type NodeBounds =
   ( aabb_min_x :: Number
@@ -1664,8 +1675,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let
       encodeCommands colorTexture = do
         -- whichLoop <- Ref.modify (_ + 1) loopN
-        canvasWidth <- width canvas
-        canvasHeight <- height canvas
+        canvasWidth' <- width canvas
+        canvasHeight' <- height canvas
+        let canvasWidth = eightify canvasWidth'
+        let canvasHeight = eightify canvasHeight'
         let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
         let overshotWidth = bufferWidth / 4
         tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
@@ -1677,7 +1690,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         let workgroupXForIndirectPartition = ceil (toNumber (canvasWidth * canvasHeight) / toNumber (4 * 64))
         let workgroupX = ceil (toNumber canvasWidth / 16.0)
         let workgroupY = ceil (toNumber canvasHeight / 16.0)
-        logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition }
         cinfo <- fromArray $ map fromInt
           [ canvasWidth
           , overshotWidth
@@ -1707,6 +1719,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , fromNumber' lower_left_z
           , fromNumber' tn
           ]
+        logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition, ambitus_x, ambitus_y }
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
         -- not necessary in the loop, but useful as a stress test for animating positions
         computePassEncoder <- beginComputePass commandEncoder (x {})
@@ -1798,11 +1811,11 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           commandEncoder
           (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
           (x { texture: colorTexture })
-          (gpuExtent3DWH canvasWidth canvasHeight)
+          (gpuExtent3DWH canvasWidth' canvasHeight')
         copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
-        let debugCondition = false -- true -- whichLoop == 100
+        let debugCondition = true -- whichLoop == 100
         launchAff_ do
           toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
           liftEffect do
@@ -1824,7 +1837,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         setHeight (floor ch) canvas
         colorTexture <- getCurrentTexture context
         encodeCommands colorTexture
-        window >>= void <<< requestAnimationFrame (f unit)
+        -- window >>= void <<< requestAnimationFrame (f unit)
 
     liftEffect render
 
