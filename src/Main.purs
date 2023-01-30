@@ -120,6 +120,12 @@ struct rendering_info_struct {
   n_spheres: u32, // number of spheres
   n_bvh_nodes: u32, // number of bvh_nodes
   anti_alias_passes: u32, // number of spheres
+  ambitus_x: f32, // ambitus of the scene in x direction
+  ambitus_y: f32, // ambitus of the scene in y direction
+  lower_left_x: f32, // lower left corner of the scene in x direction
+  lower_left_y: f32, // lower left corner of the scene in y direction
+  lower_left_z: f32, // lower left corner of the scene in z direction
+  cwch: f32, // current width times current height
   current_time: f32 // current time in seconds
 }
 """
