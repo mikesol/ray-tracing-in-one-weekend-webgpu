@@ -439,8 +439,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var current_grid = lookup / 64;
   var base_lookup = current_grid * 64;
   var place_in_64 = lookup - base_lookup;
-  var current_grid_x = ((current_grid * 8) % rendering_info.real_canvas_width) + (place_in_64 % 8);
-  var current_grid_y = ((current_grid * 8) / rendering_info.real_canvas_width) * 8 + (place_in_64 / 8);
+  var cg8 = current_grid * 8;
+  var running_index = (cg8 % rendering_info.real_canvas_width) + (place_in_64 % 8);
+  var current_grid_x = (running_index) % rendering_info.real_canvas_width;
+  var current_grid_y = ((cg8 / rendering_info.real_canvas_width) + select(0u, 1u, running_index != current_grid_x)) * 8 + (place_in_64 / 8);
   var px = fuzzable(current_grid_x, 0) / f32(rendering_info.real_canvas_width);
   var py = 1. - fuzzable(current_grid_y, 0) / f32(rendering_info.canvas_height);
   var r: ray;
