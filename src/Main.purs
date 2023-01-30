@@ -29,6 +29,7 @@ import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
 import Data.Tuple (Tuple(..), snd)
 import Data.UInt (fromInt)
+import Debug (spy)
 import Deku.Attribute ((!:=))
 import Deku.Attributes (id_, klass_)
 import Deku.Control (text, text_, (<#~>))
@@ -260,8 +261,9 @@ struct hit_record {
   p: vec3<f32>,
   normal: vec3<f32>
 }
-
       """
+
+yAxisStride = "\nconst y_axis_stride = 256u\n" :: String
 
 pointAtParameter :: String
 pointAtParameter =
@@ -344,6 +346,189 @@ type MainComputeInfo =
   , aaP :: Int
   , usesContrast :: Boolean
   )
+
+partitionInitialRaysAndXYZs :: String
+partitionInitialRaysAndXYZs =
+  """
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(1) var<storage, read_write> rays : array<ray>;
+@group(0) @binding(2) var<storage, read> xyzs : array<xyz>;
+@compute @workgroup_size(1, 64, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  var lookup = global_id.x * y_axis_stride + global_id.y;
+  if (lookup >= rendering_info_struct.cwch) {
+    return;
+  }
+  // we want each group of 64 threads to work on an 8x8 grid for the initial partition
+  var current_grid = lookup / 64;
+  var base_lookup = lookup * 64;
+  var place_in_64 = lookup - base_lookup;
+  var current_grid_x = ((current_grid * 8) % rendering_info.real_canvas_width) + (place_in_64 % 8);
+  var current_grid_y = ((current_grid * 8) / rendering_info.real_canvas_width) + (place_in_64 / 8);
+  var px = fuzzable(current_grid_x, 0) / f32(rendering_info.real_canvas_width);
+  py = 1. - f32(current_grid_y) / f32(rendering_info.canvas_height));
+  ray.origin = origin;
+  ray.direction =  = vec3(-rendering_info.ambitus_x / 2.0, -rendering_info.ambitus_y / 2.0, -1.0) + vec3(px * rendering_info.ambitus_x, py * rendering_info.ambitus_y, 0.0);
+  rays[lookup] = ray;
+  var my_xyz: xyz;
+  my_xyz.x = current_grid_x;
+  my_xyz.y = current_grid_y;
+  my_xyz.z = 0;
+  xyzs[lookup] = my_xyz;
+}
+  """
+
+setFirstIndirectBuffer :: String
+setFirstIndirectBuffer =
+  """
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(1) var<storage, read_write> indirection : vec3<u32>;
+@compute @workgroup_size(1, 1, 1)
+fn main() {
+  var xv = rendering_info.cwch / (64 * 4);
+  indirection.x = select(xv, xv + 1, xv * (64 * 4) == rendering_info.cwch);
+  indirection.y = 4u;
+  indirection.z = 1u;
+}
+  """
+
+mainComputeBody0 :: String
+mainComputeBody0 = """
+// main
+
+const t_min = 0.0001;
+const t_max = 10000.f;
+var<workgroup> colors: array<vec3<f32>, 64>;
+
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
+@group(0) @binding(2) var<storage, read> bvh_nodes : array<bvh_node>;
+@group(1) @binding(0) var<storage, read> rays : array<ray>;
+@group(1) @binding(1) var<storage, read> ixs : array<u32>;
+@group(1) @binding(2) var<storage, read> run_info : bvh_info_struct;
+@group(1) @binding(3) var<storage, read_write> sphere_hit : array<sphere_hit_info>;
+@group(1) @binding(4) var<storage, read_write> sky_hit : array<sky_hit_info>;
+
+@compute @workgroup_size(1, 64, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  ////////////////////////////////////////
+  ////////////////////////////////////////
+  var lookup = global_id.x * 64 * 4 + global_id.y;
+  if (lookup >= bvh_info_struct.total_n) {
+    return;
+  }
+  var ix = ixs[lookup];
+  var ray = rays[ix];
+  var hit: f32;
+  var sphere_ix: u32;
+  var bvh_read_playhead: u32;
+  var bvh_write_playhead: u32;
+  var sphere_read_playhead: u32;
+  var sphere_write_playhead: u32;
+  var bvh_ixs: array<u32, 64>;
+  var sphere_ixs: array<u32, 64>;
+
+  ////////////////////////////////////////
+  ////////////////////////////////////////
+  var last_node_ix = rendering_info.n_bvh_nodes - 1;
+
+  ////////////////////////////////////////
+  var last_node = bvh_nodes[last_node_ix];
+  hit = 1000.f;
+  sphere_ix = 0u;
+  if (last_node.is_sphere == 1u) {
+    sphere_ixs[0] = last_node_ix;
+    sphere_write_playhead = 1u;
+  } else {
+    bvh_ixs[0] = last_node_ix;
+    bvh_write_playhead = 1u;
+  }
+  sphere_read_playhead = 0u;
+  bvh_read_playhead = 0u;
+  var currentBVH = bvh_write_playhead - bvh_read_playhead;
+  var currentSphere = sphere_write_playhead - sphere_read_playhead;
+  var is_done = false;
+  loop {
+    if (is_done) {
+      break;
+    }
+    var starting_bvh_write_playhead = bvh_write_playhead;
+    var starting_sphere_write_playhead = sphere_write_playhead;
+    // bvh
+    if (starting_bvh_write_playhead > bvh_read_playhead) {
+      var bloc = bvh_ixs[bvh_read_playhead % 64];
+      var node = bvh_nodes[bloc];
+      var bbox: aabb;
+      bvh_node_bounding_box(&node, &bbox);
+      var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
+      /////
+      if (was_aabb_hit) {
+        if (bvh_nodes[node.left].is_sphere == 1u) {
+          sphere_ixs[sphere_write_playhead % 64] = node.left;
+          sphere_write_playhead++;
+        } else {
+          bvh_ixs[(bvh_write_playhead) % 64] = node.left;
+          bvh_write_playhead++;
+        }
+        if (bvh_nodes[node.right].is_sphere == 1u) {
+          sphere_ixs[(sphere_write_playhead) % 64] = node.right;
+          sphere_write_playhead++;
+        } else {
+          bvh_ixs[(bvh_write_playhead) % 64] = node.right;
+          bvh_write_playhead++;
+        }
+      }
+      bvh_read_playhead += 1;
+    }
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////
+    if (starting_sphere_write_playhead > sphere_read_playhead) {
+      // sphere
+      var sloc = sphere_ixs[(sphere_read_playhead) % 64];
+      var node = bvh_nodes[sloc];
+      var hit_t: f32;
+      var sphere_test = node.left * 4u;
+      var sphere_hit = hit_sphere(
+        sphere_info[sphere_test],
+        sphere_info[sphere_test+1],
+        sphere_info[sphere_test+2],
+        sphere_info[sphere_test+3],
+        &ray,
+        t_min,
+        t_max,
+        &hit_t);
+      var i_plus_1 = node.left + 1u;
+      var old_t = hit;
+      var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
+      hit = new_t;
+      var old_ix = sphere_ix;
+      sphere_ix =
+        select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
+      sphere_read_playhead += 1;
+    }
+    is_done = (sphere_write_playhead == sphere_read_playhead) && (bvh_write_playhead == bvh_read_playhead);
+  }
+
+  var was_i_hit = sphere_ix > 0u;
+  if (i_was_hit) {
+    i = atomicAdd(&rendering_info.n_hits, 1u);
+    var hit_info: sphere_hit_info;
+    hit_info.t = hit;
+    hit_info.sphere_ix = sphere_ix - 1;
+    hit_info.ix = ix;
+    sphere_hit[i] = hit_info;
+  } else {
+    i = atomicAdd(&rendering_info.n_misses, 1u);
+    var hit_info: sky_hit_info;
+    hit_info.ix = ix;
+    sky_hit[i] = hit_info;
+  }
+}
+"""
+
 
 mainComputeBody :: { | MainComputeInfo } -> String
 mainComputeBody { kX, kY, arrL, sqS, sqA, aaP, usesContrast } = fold
@@ -595,6 +780,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   , """}
 """
   ]
+  
 
 type NodeBounds =
   ( aabb_min_x :: Number
@@ -836,8 +1022,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           )
       bvhNodes = spheresToBVHNodes seed spheres
       rawSphereData = map fromNumber' (spheresToFlatRep spheres)
-    logShow bvhNodes
-    logShow spheres
+    -- logShow bvhNodes
+    -- logShow spheres
     bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
     let nSpheres = NEA.length spheres
     let nBVHNodes = NEA.length bvhNodes
@@ -852,7 +1038,11 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       { size: deviceLimits.maxStorageBufferBindingSize
       , usage: GPUBufferUsage.storage
       }
-    contrastCounter <- liftEffect $ createBuffer device $ x
+    indirectBuffer <- liftEffect $ createBuffer device $ x
+      { size: 12
+      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+      }
+    oldIndirectBufferDeleteMe <- liftEffect $ createBuffer device $ x
       { size: 12
       , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
       }
@@ -876,6 +1066,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let
       (zeroOutBufferStage :: GPUProgrammableStage) = x
         { "module": zeroOutBufferModule
+        , entryPoint: "main"
+        }
+    let
+      resetIndirectBufferDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , setFirstIndirectBuffer]
+        }
+    resetIndirectBufferModule <- liftEffect $ createShaderModule device resetIndirectBufferDesc
+    let
+      (resetIndirectBufferStage :: GPUProgrammableStage) = x
+        { "module": resetIndirectBufferModule
         , entryPoint: "main"
         }
     let
@@ -970,7 +1173,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         }
     let
       mainComputeDesc = x
-        { code: fold
+        { code: spy "mcp" $ fold
             [ lerp
             , lerpv
             , inputData
@@ -1125,13 +1328,21 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           ]
       , label: "wCanvasBindGroup"
       }
-    wContrastCounterBindGroup <- liftEffect $ createBindGroup device $ x
+    wIndirectBufferBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
-              (x { buffer: contrastCounter } :: GPUBufferBinding)
+              (x { buffer: indirectBuffer } :: GPUBufferBinding)
           ]
-      , label: "wContrastCounterBindGroup"
+      , label: "wIndirectBufferBindGroup"
+      }
+    wOldIndirectBufferDeleteMeBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: wBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: oldIndirectBufferDeleteMe } :: GPUBufferBinding)
+          ]
+      , label: "wOldIndirectBufferDeleteMeBindGroup"
       }
     contrastBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: contrastBindGroupLayout
@@ -1139,7 +1350,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           [ gpuBindGroupEntry 0
               (x { buffer: contrastIxs } :: GPUBufferBinding)
           , gpuBindGroupEntry 1
-              (x { buffer: contrastCounter } :: GPUBufferBinding)
+              (x { buffer: oldIndirectBufferDeleteMe } :: GPUBufferBinding)
           ]
       , label: "contrastBindGroup"
       }
@@ -1164,10 +1375,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       , compute: zeroOutBufferStage
       , label: "zeroOutBufferPipeline"
       }
-    resetContrastBufferPipeline <- liftEffect $ createComputePipeline device $ x
+    resetIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOPipelineLayout
+      , compute: resetIndirectBufferStage
+      , label: "resetIndirectBufferPipeline"
+      }
+    oldResetContrastBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
       , compute: resetContrastBufferStage
-      , label: "resetContrastBufferPipeline"
+      , label: "oldResetContrastBufferPipeline"
       }
     mainComputePipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOPipelineLayout
@@ -1229,39 +1445,48 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         -- set reader for all computations
         GPUComputePassEncoder.setBindGroup computePassEncoder 0
           readerBindGroup
-        -- clear colors as they're subject to an atomic operation
+        -- clear canvas
         GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wCanvasBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupOvershootX workgroupOvershootY 1
+        -- OLD clear contrast indices
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wContrastIxsBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
+        -- OLD clear indirect buffer
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wContrastCounterBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder resetContrastBufferPipeline
+          wOldIndirectBufferDeleteMeBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder oldResetContrastBufferPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
-        ------------------------
-        -- do bvh, color mapping and anti-aliasing
+        -- NEW set indirect buffer ✅
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wIndirectBufferBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder resetIndirectBufferPipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+        -- NEW set ray & xyz buffer
+        -- OLD AND NEW do bvh
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
           wCanvasBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
           mainComputePipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
-        -----------------------------------
-        -----------------------------------
+        -- NEW do coloring
+        -- OLD AND NEW determine contrast
+        -- but in NEW fill xyz and ray buffer
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           contrastBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
           contrastPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder contrastX contrastY 1
-        -----------------------------------
-        -----------------------------------
+        -- OLD anti alias pipeline
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           rContrastIxsBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
           antiAliasPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder contrastCounter 0
+        GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder oldIndirectBufferDeleteMe 0
+        -- NEW this whole thing loops over the contrast indices
+        -- NEW sum to colors
         --
         GPUComputePassEncoder.end computePassEncoder
         copyBufferToTexture
