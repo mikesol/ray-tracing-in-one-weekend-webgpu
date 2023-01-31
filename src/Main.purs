@@ -53,6 +53,7 @@ import Web.GPU.BufferSource (fromUint32Array)
 import Web.GPU.GPU (requestAdapter)
 import Web.GPU.GPUAdapter (requestDevice)
 import Web.GPU.GPUBindGroupEntry (GPUBufferBinding, gpuBindGroupEntry)
+import Web.GPU.GPUBindGroupLayout (GPUBindGroupLayout)
 import Web.GPU.GPUBindGroupLayoutEntry (gpuBindGroupLayoutEntry)
 import Web.GPU.GPUBuffer (GPUBuffer, getMappedRange, mapAsync, unmap)
 import Web.GPU.GPUBufferBindingLayout (GPUBufferBindingLayout)
@@ -64,10 +65,12 @@ import Web.GPU.GPUCanvasConfiguration (GPUCanvasConfiguration)
 import Web.GPU.GPUCanvasContext (configure, getCurrentTexture)
 import Web.GPU.GPUCommandEncoder (beginComputePass, copyBufferToBuffer, copyBufferToTexture, finish)
 import Web.GPU.GPUComputePassEncoder as GPUComputePassEncoder
+import Web.GPU.GPUComputePipeline (GPUComputePipeline)
 import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, createBuffer, createCommandEncoder, createComputePipeline, createPipelineLayout, createShaderModule, limits)
 import Web.GPU.GPUDevice as GPUDevice
 import Web.GPU.GPUExtent3D (gpuExtent3DWH)
 import Web.GPU.GPUMapMode as GPUMapMode
+import Web.GPU.GPUPipelineLayout (GPUPipelineLayout)
 import Web.GPU.GPUProgrammableStage (GPUProgrammableStage)
 import Web.GPU.GPUQueue (onSubmittedWorkDone, submit, writeBuffer)
 import Web.GPU.GPUShaderStage as GPUShaderStage
@@ -79,7 +82,7 @@ import Web.GPU.Internal.RequiredAndOptional (x)
 import Web.GPU.Navigator (gpu)
 import Web.HTML (HTMLCanvasElement, window)
 import Web.HTML.HTMLCanvasElement (height, setHeight, setWidth, toElement, width)
-import Web.HTML.Window (navigator, requestAnimationFrame)
+import Web.HTML.Window (navigator)
 import Web.Promise as Web.Promise
 
 kernelX :: Int
@@ -462,9 +465,10 @@ type MainComputeInfo =
   , usesContrast :: Boolean
   )
 
-partitionInitialRaysAndXYZs :: String
-partitionInitialRaysAndXYZs =
-  """
+partitionInitialRaysAndXYZs :: { z :: Int } -> String
+partitionInitialRaysAndXYZs { z } =
+  fold
+    [ """
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> rays : array<ray>;
 @group(1) @binding(1) var<storage, read_write> xyzs : array<vec3<u32>>;
@@ -491,7 +495,9 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.origin = origin;
   r.direction = vec3(-rendering_info.ambitus_x / 2.0, -rendering_info.ambitus_y / 2.0, -1.0) + vec3(px * rendering_info.ambitus_x, py * rendering_info.ambitus_y, 0.0);
   rays[lookup] = r;
-  xyzs[lookup] = vec3<u32>(current_grid_x, current_grid_y, 0u);
+  xyzs[lookup] = vec3<u32>(current_grid_x, current_grid_y, """
+    , show z
+    , """u);
   ixs[lookup] = lookup;
   var ac: aliased_color;
   ac.r0 = 1.f;
@@ -512,6 +518,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   raw_colors[lookup] = ac;
 }
   """
+    ]
 
 setFirstIndirectBuffer :: String
 setFirstIndirectBuffer =
@@ -1097,11 +1104,42 @@ makeSkyHitStage device shaderRun = do
             , skyHitShader { shaderRun }
             ]
       }
-  skyHitModule <- liftEffect $ createShaderModule device skyHitDesc
+  skyHitModule <- createShaderModule device skyHitDesc
   pure $ x
     { "module": skyHitModule
     , entryPoint: "main"
     }
+
+makeInitialPartitionStage :: GPUDevice -> Int -> Effect GPUProgrammableStage
+makeInitialPartitionStage device z = do
+  let
+    partitionInitialRaysAndXYZsDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , fuzzable
+            , ray
+            , aliasedColor
+            , yAxisStride
+            , usefulConsts
+            , partitionInitialRaysAndXYZs { z }
+            ]
+      }
+  partitionInitialRaysAndXYZsModule <- createShaderModule device partitionInitialRaysAndXYZsDesc
+  pure $ x
+    { "module": partitionInitialRaysAndXYZsModule
+    , entryPoint: "main"
+    }
+
+makeInitialPartitionPipeline :: GPUPipelineLayout -> GPUDevice -> Int -> Effect GPUComputePipeline
+makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device z = do
+  partitionInitialRaysAndXYZsStage <- makeInitialPartitionStage device z
+  partitionInitialRaysAndXYZsPipeline <- createComputePipeline device $ x
+    { layout: partitionInitialRaysAndXYZsBindGroupLayout
+    , compute: partitionInitialRaysAndXYZsStage
+    , label: "partitionInitialRaysAndXYZsPipeline" <> show z
+    }
+  pure partitionInitialRaysAndXYZsPipeline
 
 makeSphereHitStage :: GPUDevice -> ShaderRun -> Effect GPUProgrammableStage
 makeSphereHitStage device shaderRun = do
@@ -1128,7 +1166,7 @@ makeSphereHitStage device shaderRun = do
             , sphereHitShader { shaderRun }
             ]
       }
-  sphereHitModule <- liftEffect $ createShaderModule device sphereHitDesc
+  sphereHitModule <- createShaderModule device sphereHitDesc
   pure $ x
     { "module": sphereHitModule
     , entryPoint: "main"
@@ -1265,7 +1303,7 @@ averager :: Effect (Number -> Effect Number)
 averager = do
   ct <- Ref.new []
   pure \v -> do
-    ct' <- Ref.modify (\x -> if length x >= 10 then A.drop 1 x else x <> [v] ) ct
+    ct' <- Ref.modify (\x -> if length x >= 10 then A.drop 1 x else x <> [ v ]) ct
     pure $ sum ct' / toNumber (length ct')
 
 convertPromise :: Web.Promise.Promise ~> Control.Promise.Promise
@@ -1355,956 +1393,941 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           showErrorMessage
           throwError $ error "WebGPU is not supported"
         Just device -> pure device
-    queue <- liftEffect $ GPUDevice.queue device
-    deviceLimits <- liftEffect $ limits device
-    canvasInfoBuffer <- liftEffect $ createBuffer device $ x
-      { size: 48 -- align(4) size(52)
-      , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
-      }
-    debugBuffer <- liftEffect $ createBuffer device $ x
-      { size: 65536
-      , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
-      }
-    debugOutputBuffer <- liftEffect $ createBuffer device $ x
-      { size: 65536
-      , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
-      }
-    seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 0 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
-    let
-      spheres =
-        cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
-          ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
-            ] <> randos
-          )
-      bvhNodes = spheresToBVHNodes seed spheres
-      rawSphereData = map fromNumber' (spheresToFlatRep spheres)
-    -- logShow bvhNodes
-    -- logShow spheres
-    bvhNodeData <- liftEffect $ bvhNodesToFloat32Array bvhNodes
-    let nSpheres = NEA.length spheres
-    let nBVHNodes = NEA.length bvhNodes
-    sphereData :: Float32Array <- liftEffect $ fromArray rawSphereData
-    sphereBuffer <- liftEffect $ createBufferF device sphereData GPUBufferUsage.storage
-    bvhNodeBuffer <- liftEffect $ createBufferF device bvhNodeData GPUBufferUsage.storage
-    wholeCanvasBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
-      }
-    ixBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 16
-      , usage: GPUBufferUsage.storage
-      }
-    xyzEvenBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 4
-      , usage: GPUBufferUsage.storage
-      }
-    rayEvenBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 4
-      , usage: GPUBufferUsage.storage
-      }
-    xyzOddBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 4
-      , usage: GPUBufferUsage.storage
-      }
-    rayOddBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 4
-      , usage: GPUBufferUsage.storage
-      }
-    skyHits <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 16
-      , usage: GPUBufferUsage.storage
-      }
-    sphereHits <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize / 16
-      , usage: GPUBufferUsage.storage
-      }
-    indirectBuffer <- liftEffect $ createBuffer device $ x
-      { size: 12
-      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
-      }
-    rawColorBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
-      , usage: GPUBufferUsage.storage
-      }
-    skyHitIndirectBuffer <- liftEffect $ createBuffer device $ x
-      { size: 12
-      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
-      }
-    sphereHitIndirectBuffer <- liftEffect $ createBuffer device $ x
-      { size: 12
-      , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
-      }
-    bvhInfo <- liftEffect $ createBuffer device $ x
-      { size: 24
-      , usage: GPUBufferUsage.storage
-      }
+    liftEffect do
+      queue <- GPUDevice.queue device
+      deviceLimits <- limits device
+      canvasInfoBuffer <- createBuffer device $ x
+        { size: 48 -- align(4) size(52)
+        , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.storage
+        }
+      debugBuffer <- createBuffer device $ x
+        { size: 65536
+        , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
+        }
+      debugOutputBuffer <- createBuffer device $ x
+        { size: 65536
+        , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
+        }
+      seed <- randomInt 42 42424242
+      randos <- sequence $ replicate 0 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
+      let
+        spheres =
+          cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
+            ( [ Sphere { cx: 0.0, cy: -100.5, cz: -1.0, radius: 100.0 }
+              ] <> randos
+            )
+        bvhNodes = spheresToBVHNodes seed spheres
+        rawSphereData = map fromNumber' (spheresToFlatRep spheres)
+      -- logShow bvhNodes
+      -- logShow spheres
+      bvhNodeData <- bvhNodesToFloat32Array bvhNodes
+      let nSpheres = NEA.length spheres
+      let nBVHNodes = NEA.length bvhNodes
+      sphereData :: Float32Array <- fromArray rawSphereData
+      sphereBuffer <- createBufferF device sphereData GPUBufferUsage.storage
+      bvhNodeBuffer <- createBufferF device bvhNodeData GPUBufferUsage.storage
+      wholeCanvasBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize
+        , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
+        }
+      ixBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 16
+        , usage: GPUBufferUsage.storage
+        }
+      xyzEvenBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      rayEvenBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      xyzOddBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      rayOddBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      skyHits <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 16
+        , usage: GPUBufferUsage.storage
+        }
+      sphereHits <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 16
+        , usage: GPUBufferUsage.storage
+        }
+      indirectBuffer <- createBuffer device $ x
+        { size: 12
+        , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+        }
+      rawColorBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize
+        , usage: GPUBufferUsage.storage
+        }
+      skyHitIndirectBuffer <- createBuffer device $ x
+        { size: 12
+        , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+        }
+      sphereHitIndirectBuffer <- createBuffer device $ x
+        { size: 12
+        , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
+        }
+      bvhInfo <- createBuffer device $ x
+        { size: 24
+        , usage: GPUBufferUsage.storage
+        }
 
-    let
-      zeroOutBufferDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , """
-// main
-@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-@group(1) @binding(0) var<storage, read_write> color_arary : array<u32>;
-@compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  color_arary[global_id.y * rendering_info.overshot_canvas_width + global_id.x] = 0u;
-}"""
-              ]
-        }
-    zeroOutBufferModule <- liftEffect $ createShaderModule device zeroOutBufferDesc
-    let
-      (zeroOutBufferStage :: GPUProgrammableStage) = x
-        { "module": zeroOutBufferModule
-        , entryPoint: "main"
-        }
-    let
-      resetFirstIndirectBufferDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , bvhInfoNonAtomic
-              , yAxisStride
-              , setFirstIndirectBuffer
-              ]
-        }
-    resetFirstIndirectBufferModule <- liftEffect $ createShaderModule device resetFirstIndirectBufferDesc
-    let
-      (resetFirstIndirectBufferStage :: GPUProgrammableStage) = x
-        { "module": resetFirstIndirectBufferModule
-        , entryPoint: "main"
-        }
-    let
-      resetSecondIndirectBufferDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , bvhInfoNonAtomic
-              , yAxisStride
-              , setSecondIndirectBuffer
-              ]
-        }
-    resetSecondIndirectBufferModule <- liftEffect $ createShaderModule device resetSecondIndirectBufferDesc
-    let
-      (resetSecondIndirectBufferStage :: GPUProgrammableStage) = x
-        { "module": resetSecondIndirectBufferModule
-        , entryPoint: "main"
-        }
-    let
-      resetThirdIndirectBufferDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , bvhInfoNonAtomic
-              , yAxisStride
-              , setThirdIndirectBuffer
-              ]
-        }
-    resetThirdIndirectBufferModule <- liftEffect $ createShaderModule device resetThirdIndirectBufferDesc
-    let
-      (resetThirdIndirectBufferStage :: GPUProgrammableStage) = x
-        { "module": resetThirdIndirectBufferModule
-        , entryPoint: "main"
-        }
-    let
-      assembleSkyAndSphereHitDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , bvhInfoNonAtomic
-              , yAxisStride
-              , assembleSkyAndSphereHitIndirectBuffers
-              ]
-        }
-    assembleSkyAndSphereHitModule <- liftEffect $ createShaderModule device assembleSkyAndSphereHitDesc
-    let
-      (assembleSkyAndSphereHitStage :: GPUProgrammableStage) = x
-        { "module": assembleSkyAndSphereHitModule
-        , entryPoint: "main"
-        }
-    let
-      partitionInitialRaysAndXYZsDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , fuzzable
-              , ray
-              , aliasedColor
-              , yAxisStride
-              , usefulConsts
-              , partitionInitialRaysAndXYZs
-              ]
-        }
-    partitionInitialRaysAndXYZsModule <- liftEffect $ createShaderModule device partitionInitialRaysAndXYZsDesc
-    let
-      (partitionInitialRaysAndXYZsStage :: GPUProgrammableStage) = x
-        { "module": partitionInitialRaysAndXYZsModule
-        , entryPoint: "main"
-        }
-    let
-      assembleRawColorsDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , fuzzable
-              , ray
-              , aliasedColor
-              , yAxisStride
-              , usefulConsts
-              , assembleRawColorsShader
-              ]
-        }
-    assembleRawColorsModule <- liftEffect $ createShaderModule device assembleRawColorsDesc
-    let
-      (assembleRawColorsStage :: GPUProgrammableStage) = x
-        { "module": assembleRawColorsModule
-        , entryPoint: "main"
-        }
-    --     let
-    --       contrastDesc = x
-    --         { code:
-    --             intercalate "\n"
-    --               [ inputData
-    --               , """
-    -- // main
-    -- @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
-    -- @group(1) @binding(0) var<storage, read_write> color_array : array<u32>;
-    -- @group(2) @binding(0) var<storage, read_write> contrast_ixs : array<u32>;
-    -- @group(2) @binding(1) var<storage, read_write> contrast_counter : atomic<u32>;
-    -- @compute @workgroup_size(16, 16, 1)
-    -- fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-    --   var i_x = global_id.x * 4;
-    --   var i_y = global_id.y * 4;
-    --   if (i_x >= rendering_info.real_canvas_width || i_y >= rendering_info.canvas_height) {
-    --     return;
-    --   }
-    --   var c0ix =   i_x + ((i_y + 0) * rendering_info.overshot_canvas_width);
-    --   var c1ix = 1 + c0ix;
-    --   var c2ix = 2 + c0ix;
-    --   var c3ix = 3 + c0ix;
-    --   var c4ix =   i_x + ((i_y + 1) * rendering_info.overshot_canvas_width);
-    --   var c5ix = 1 + c4ix;
-    --   var c6ix = 2 + c4ix;
-    --   var c7ix = 3 + c4ix;
-    --   var c8ix =   i_x + ((i_y + 2) * rendering_info.overshot_canvas_width);
-    --   var c9ix = 1 + c8ix;
-    --   var c10ix = 2 + c8ix;
-    --   var c11ix = 3 + c8ix;
-    --   var c12ix =   i_x + ((i_y + 3) * rendering_info.overshot_canvas_width);
-    --   var c13ix = 1 + c12ix;
-    --   var c14ix = 2 + c12ix;
-    --   var c15ix = 3 + c12ix;
-    --   var c0 = unpack4x8unorm(color_array[c0ix]);
-    --   var c1 = unpack4x8unorm(color_array[c1ix]);
-    --   var c2 = unpack4x8unorm(color_array[c2ix]);
-    --   var c3 = unpack4x8unorm(color_array[c3ix]);
-    --   var c4 = unpack4x8unorm(color_array[c4ix]);
-    --   var c5 = unpack4x8unorm(color_array[c5ix]);
-    --   var c6 = unpack4x8unorm(color_array[c6ix]);
-    --   var c7 = unpack4x8unorm(color_array[c7ix]);
-    --   var c8 = unpack4x8unorm(color_array[c8ix]);
-    --   var c9 = unpack4x8unorm(color_array[c9ix]);
-    --   var c10 = unpack4x8unorm(color_array[c10ix]);
-    --   var c11 = unpack4x8unorm(color_array[c11ix]);
-    --   var c12 = unpack4x8unorm(color_array[c12ix]);
-    --   var c13 = unpack4x8unorm(color_array[c13ix]);
-    --   var c14 = unpack4x8unorm(color_array[c14ix]);
-    --   var c15 = unpack4x8unorm(color_array[c15ix]);
-    --   var mn = min(c0, min(c1, min(c2, min(c3, min(c4, min(c5, min(c6, min(c7, min(c8, min(c9, min(c10, min(c11, min(c12, min(c13, min(c14, c15)))))))))))))));
-    --   var mx = max(c0, max(c1, max(c2, max(c3, max(c4, max(c5, max(c6, max(c7, max(c8, max(c9, max(c10, max(c11, max(c12, max(c13, max(c14, c15)))))))))))))));
-    --   if (distance(vec3(mx.r,mx.g,mx.b),vec3(mn.r,mn.g,mn.b)) > """
-    --               , show contrastThreshold
-    --               , """) {
-    --     var ix = atomicAdd(&contrast_counter, 1u);
-    --     contrast_ixs[ix] = i_x | (i_y << 16);
-    --   }
-    -- }"""
-    --               ]
-    --         }
-    --     contrastModule <- liftEffect $ createShaderModule device contrastDesc
+      let
+        zeroOutBufferDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , """
+  // main
+  @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+  @group(1) @binding(0) var<storage, read_write> color_arary : array<u32>;
+  @compute @workgroup_size(16, 16, 1)
+  fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+    color_arary[global_id.y * rendering_info.overshot_canvas_width + global_id.x] = 0u;
+  }"""
+                ]
+          }
+      zeroOutBufferModule <- createShaderModule device zeroOutBufferDesc
+      let
+        (zeroOutBufferStage :: GPUProgrammableStage) = x
+          { "module": zeroOutBufferModule
+          , entryPoint: "main"
+          }
+      let
+        resetFirstIndirectBufferDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , bvhInfoNonAtomic
+                , yAxisStride
+                , setFirstIndirectBuffer
+                ]
+          }
+      resetFirstIndirectBufferModule <- createShaderModule device resetFirstIndirectBufferDesc
+      let
+        (resetFirstIndirectBufferStage :: GPUProgrammableStage) = x
+          { "module": resetFirstIndirectBufferModule
+          , entryPoint: "main"
+          }
+      let
+        resetSecondIndirectBufferDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , bvhInfoNonAtomic
+                , yAxisStride
+                , setSecondIndirectBuffer
+                ]
+          }
+      resetSecondIndirectBufferModule <- createShaderModule device resetSecondIndirectBufferDesc
+      let
+        (resetSecondIndirectBufferStage :: GPUProgrammableStage) = x
+          { "module": resetSecondIndirectBufferModule
+          , entryPoint: "main"
+          }
+      let
+        resetThirdIndirectBufferDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , bvhInfoNonAtomic
+                , yAxisStride
+                , setThirdIndirectBuffer
+                ]
+          }
+      resetThirdIndirectBufferModule <- createShaderModule device resetThirdIndirectBufferDesc
+      let
+        (resetThirdIndirectBufferStage :: GPUProgrammableStage) = x
+          { "module": resetThirdIndirectBufferModule
+          , entryPoint: "main"
+          }
+      let
+        assembleSkyAndSphereHitDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , bvhInfoNonAtomic
+                , yAxisStride
+                , assembleSkyAndSphereHitIndirectBuffers
+                ]
+          }
+      assembleSkyAndSphereHitModule <- createShaderModule device assembleSkyAndSphereHitDesc
+      let
+        (assembleSkyAndSphereHitStage :: GPUProgrammableStage) = x
+          { "module": assembleSkyAndSphereHitModule
+          , entryPoint: "main"
+          }
 
-    readerBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [
-                -- info about the current scene
-                gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+      let
+        assembleRawColorsDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , fuzzable
+                , ray
+                , aliasedColor
+                , yAxisStride
+                , usefulConsts
+                , assembleRawColorsShader
+                ]
+          }
+      assembleRawColorsModule <- createShaderModule device assembleRawColorsDesc
+      let
+        (assembleRawColorsStage :: GPUProgrammableStage) = x
+          { "module": assembleRawColorsModule
+          , entryPoint: "main"
+          }
+      --     let
+      --       contrastDesc = x
+      --         { code:
+      --             intercalate "\n"
+      --               [ inputData
+      --               , """
+      -- // main
+      -- @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+      -- @group(1) @binding(0) var<storage, read_write> color_array : array<u32>;
+      -- @group(2) @binding(0) var<storage, read_write> contrast_ixs : array<u32>;
+      -- @group(2) @binding(1) var<storage, read_write> contrast_counter : atomic<u32>;
+      -- @compute @workgroup_size(16, 16, 1)
+      -- fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+      --   var i_x = global_id.x * 4;
+      --   var i_y = global_id.y * 4;
+      --   if (i_x >= rendering_info.real_canvas_width || i_y >= rendering_info.canvas_height) {
+      --     return;
+      --   }
+      --   var c0ix =   i_x + ((i_y + 0) * rendering_info.overshot_canvas_width);
+      --   var c1ix = 1 + c0ix;
+      --   var c2ix = 2 + c0ix;
+      --   var c3ix = 3 + c0ix;
+      --   var c4ix =   i_x + ((i_y + 1) * rendering_info.overshot_canvas_width);
+      --   var c5ix = 1 + c4ix;
+      --   var c6ix = 2 + c4ix;
+      --   var c7ix = 3 + c4ix;
+      --   var c8ix =   i_x + ((i_y + 2) * rendering_info.overshot_canvas_width);
+      --   var c9ix = 1 + c8ix;
+      --   var c10ix = 2 + c8ix;
+      --   var c11ix = 3 + c8ix;
+      --   var c12ix =   i_x + ((i_y + 3) * rendering_info.overshot_canvas_width);
+      --   var c13ix = 1 + c12ix;
+      --   var c14ix = 2 + c12ix;
+      --   var c15ix = 3 + c12ix;
+      --   var c0 = unpack4x8unorm(color_array[c0ix]);
+      --   var c1 = unpack4x8unorm(color_array[c1ix]);
+      --   var c2 = unpack4x8unorm(color_array[c2ix]);
+      --   var c3 = unpack4x8unorm(color_array[c3ix]);
+      --   var c4 = unpack4x8unorm(color_array[c4ix]);
+      --   var c5 = unpack4x8unorm(color_array[c5ix]);
+      --   var c6 = unpack4x8unorm(color_array[c6ix]);
+      --   var c7 = unpack4x8unorm(color_array[c7ix]);
+      --   var c8 = unpack4x8unorm(color_array[c8ix]);
+      --   var c9 = unpack4x8unorm(color_array[c9ix]);
+      --   var c10 = unpack4x8unorm(color_array[c10ix]);
+      --   var c11 = unpack4x8unorm(color_array[c11ix]);
+      --   var c12 = unpack4x8unorm(color_array[c12ix]);
+      --   var c13 = unpack4x8unorm(color_array[c13ix]);
+      --   var c14 = unpack4x8unorm(color_array[c14ix]);
+      --   var c15 = unpack4x8unorm(color_array[c15ix]);
+      --   var mn = min(c0, min(c1, min(c2, min(c3, min(c4, min(c5, min(c6, min(c7, min(c8, min(c9, min(c10, min(c11, min(c12, min(c13, min(c14, c15)))))))))))))));
+      --   var mx = max(c0, max(c1, max(c2, max(c3, max(c4, max(c5, max(c6, max(c7, max(c8, max(c9, max(c10, max(c11, max(c12, max(c13, max(c14, c15)))))))))))))));
+      --   if (distance(vec3(mx.r,mx.g,mx.b),vec3(mn.r,mn.g,mn.b)) > """
+      --               , show contrastThreshold
+      --               , """) {
+      --     var ix = atomicAdd(&contrast_counter, 1u);
+      --     contrast_ixs[ix] = i_x | (i_y << 16);
+      --   }
+      -- }"""
+      --               ]
+      --         }
+      --     contrastModule <- createShaderModule device contrastDesc
+
+      readerBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [
+                  -- info about the current scene
+                  gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.readOnlyStorage }
+                        :: GPUBufferBindingLayout
+                    )
+                -- spheres
+                , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.readOnlyStorage }
+                        :: GPUBufferBindingLayout
+                    )
+                -- bounding boxes
+                , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.readOnlyStorage }
+                        :: GPUBufferBindingLayout
+                    )
+                ]
+            , label: "readerBindGroupLayout"
+            }
+      rBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.readOnlyStorage }
+                        :: GPUBufferBindingLayout
+                    )
+                ]
+            , label: "rBindGroupLayout"
+            }
+      r2BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
                   ( x { type: GPUBufferBindingType.readOnlyStorage }
                       :: GPUBufferBindingLayout
                   )
-              -- spheres
-              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.readOnlyStorage }
+            , label: "r2BindGroupLayout"
+            }
+      w1r2BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                (0 .. 2) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
+                  ( x { type: if j == 0 then GPUBufferBindingType.storage else GPUBufferBindingType.readOnlyStorage }
                       :: GPUBufferBindingLayout
                   )
-              -- bounding boxes
-              , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.readOnlyStorage }
-                      :: GPUBufferBindingLayout
-                  )
-              ]
-          , label: "readerBindGroupLayout"
-          }
-    rBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.readOnlyStorage }
-                      :: GPUBufferBindingLayout
-                  )
-              ]
-          , label: "rBindGroupLayout"
-          }
-    r2BindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
-                ( x { type: GPUBufferBindingType.readOnlyStorage }
-                    :: GPUBufferBindingLayout
-                )
-          , label: "r2BindGroupLayout"
-          }
-    w1r2BindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              (0 .. 2) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
-                ( x { type: if j == 0 then GPUBufferBindingType.storage else GPUBufferBindingType.readOnlyStorage }
-                    :: GPUBufferBindingLayout
-                )
-          , label: "w1r2BindGroupLayout"
-          }
-    wBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.storage }
-                      :: GPUBufferBindingLayout
-                  )
-              ]
-          , label: "wBindGroupLayout"
-          }
-    w2BindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries: (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
-              ( x { type: GPUBufferBindingType.storage }
-                  :: GPUBufferBindingLayout
-              )
-          , label: "w2BindGroupLayout"
-          }
-    w4BindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              (0 .. 3) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
+            , label: "w1r2BindGroupLayout"
+            }
+      wBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.storage }
+                        :: GPUBufferBindingLayout
+                    )
+                ]
+            , label: "wBindGroupLayout"
+            }
+      w2BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries: (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
                 ( x { type: GPUBufferBindingType.storage }
                     :: GPUBufferBindingLayout
                 )
-          , label: "w4BindGroupLayout"
-          }
-    slowBvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.readOnlyStorage }
-                      :: GPUBufferBindingLayout
-                  )
-              ]
-          , label: "slowBvhBindGroupLayout"
-          }
-    bounceBvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              ]
-          , label: "bounceBvhBindGroupLayout"
-          }
-    quickBvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
-      $ x
-          { entries:
-              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
-              , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
+            , label: "w2BindGroupLayout"
+            }
+      w4BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                (0 .. 3) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
                   ( x { type: GPUBufferBindingType.storage }
                       :: GPUBufferBindingLayout
                   )
-              ]
-          , label: "quickBvhBindGroupLayout"
-          }
-    let debugBindGroupLayout = wBindGroupLayout
-    readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
-      , label: "readOPipelineLayout"
-      }
-    readOOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
-      , label: "readOOPipelineLayout"
-      }
-    skyAndSpherePipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ rBindGroupLayout, wBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
-      , label: "skyAndSpherePipelineLayout"
-      }
-    partitionInitialRaysAndXYZsBindGroupLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, w4BindGroupLayout, debugBindGroupLayout ]
-      , label: "partitionInitialRaysAndXYZsBindGroupLayout"
-      }
-    quickBvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, quickBvhBindGroupLayout ]
-      , label: "quickBvhPipelineLayout"
-      }
-    slowBvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, slowBvhBindGroupLayout ]
-      , label: "slowBvhPipelineLayout"
-      }
-    bounceBvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, bounceBvhBindGroupLayout ]
-      , label: "bounceBvhPipelineLayout"
-      }
-    -- technically the sky shader doesn't need to write to bvh info as we're done with bounces
-    -- but as changing it to read-only would require a layout switch we keep as write for now
-    -- makes code easier to maintain
-    skyShadingPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, rBindGroupLayout, debugBindGroupLayout ]
-      , label: "shadingPipelineLaout"
-      }
-    sphereShadingPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, r2BindGroupLayout, w2BindGroupLayout ]
-      , label: "sphereShadingPipelineLayout"
-      }
-    assembleRawColorsPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ r2BindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
-      , label: "assembleRawColorsPipelineLayout"
-      }
-    readerBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: readerBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: sphereBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
-          ]
-      , label: "readerBindGroup"
-      }
-    wCanvasBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wCanvasBindGroup"
-      }
-    wIndirectBufferBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: indirectBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wIndirectBufferBindGroup"
-      }
-    wBvhInfoBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          ]
-      , label: "wBvhInfoBindGroup"
-      }
-    wRawColorBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wRawColorBindGroup"
-      }
-    shaderReaderEvenBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: w1r2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
-          ]
-      , label: "shaderReaderEvenBindGroup"
-      }
-    shaderReaderOddBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: w1r2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: rayOddBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
-          ]
-      , label: "shaderReaderEvenBindGroup"
-      }
-    shaderWriterOddBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: w2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayOddBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
-          ]
-      , label: "shaderWriterOddBindGroup"
-      }
-    shaderWriterEvenBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: w2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
-          ]
-      , label: "shaderWriterEvenBindGroup"
-      }
-    wInitialPartitionsEvenBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: w4BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: ixBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
-              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wInitialPartitionsBindGroup"
-      }
-    rBVHInfoBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          ]
-      , label: "rBVHInfoBindGroup"
-      }
-    quickBvhBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: quickBvhBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: sphereHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
-              (x { buffer: skyHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 4
-              (x { buffer: ixBuffer } :: GPUBufferBinding)
-          ]
-      , label: "quickBvhBindGroup"
-      }
-    slowBvhBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: slowBvhBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: sphereHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
-              (x { buffer: skyHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 4
-              (x { buffer: ixBuffer } :: GPUBufferBinding)
-          ]
-      , label: "slowBvhBindGroup"
-      }
-    bounceBvhOddBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: bounceBvhBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayOddBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: sphereHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
-              (x { buffer: skyHits } :: GPUBufferBinding)
-          ]
-      , label: "bounceBvhOddBindGroup"
-      }
-    bounceBvhEvenBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: bounceBvhBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
-              (x { buffer: sphereHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
-              (x { buffer: skyHits } :: GPUBufferBinding)
-          ]
-      , label: "bounceBvhEvenBindGroup"
-      }
-    wSkyHitIndirectBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: skyHitIndirectBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wSkyHitIndirectBindGroup"
-      }
-    wSphereHitIndirectBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: wBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: sphereHitIndirectBuffer } :: GPUBufferBinding)
-          ]
-      , label: "wSphereHitIndirectBindGroup"
-      }
-    readSkyInfoBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: rBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: skyHits } :: GPUBufferBinding)
-          ]
-      , label: "readSkyInfoBindGroup"
-      }
-    readSphereInfoBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: r2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: sphereBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: sphereHits } :: GPUBufferBinding)
-          ]
-      , label: "readSphereInfoBindGroup"
-      }
-    assembleRawColorsReaderBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: r2BindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 1
-              (x { buffer: rawColorBuffer } :: GPUBufferBinding)
-          ]
-      , label: "assembleRawColorsReaderBindGroup"
-      }
-    debugBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: debugBindGroupLayout
-      , entries:
-          [ gpuBindGroupEntry 0
-              (x { buffer: debugBuffer } :: GPUBufferBinding)
-          ]
-      , label: "debugBindGroup"
-      }
-    --
-    zeroOutBufferPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readOPipelineLayout
-      , compute: zeroOutBufferStage
-      , label: "zeroOutBufferPipeline"
-      }
-    resetFirstIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readOOPipelineLayout
-      , compute: resetFirstIndirectBufferStage
-      , label: "resetFirstIndirectBufferPipeline"
-      }
-    resetSecondIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readOOPipelineLayout
-      , compute: resetSecondIndirectBufferStage
-      , label: "resetSecondIndirectBufferPipeline"
-      }
-    resetThirdIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: readOOPipelineLayout
-      , compute: resetThirdIndirectBufferStage
-      , label: "resetThirdIndirectBufferPipeline"
-      }
-    partitionInitialRaysAndXYZsPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: partitionInitialRaysAndXYZsBindGroupLayout
-      , compute: partitionInitialRaysAndXYZsStage
-      , label: "partitionInitialRaysAndXYZsPipeline"
-      }
-    bvhQuickStage <- liftEffect $ makeBVHStage device QuickBVH
-    bvhQuickPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: quickBvhPipelineLayout
-      , compute: bvhQuickStage
-      , label: "bvhQuickPipeline"
-      }
-    bvhSlowStage <- liftEffect $ makeBVHStage device SlowBVH
-    bvhSlowPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: slowBvhPipelineLayout
-      , compute: bvhSlowStage
-      , label: "bvhSlowPipeline"
-      }
-    bvhBounceStage <- liftEffect $ makeBVHStage device BounceBVH
-    bvhBouncePipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: bounceBvhPipelineLayout
-      , compute: bvhBounceStage
-      , label: "bvhBouncePipeline"
-      }
-    assembleSkyAndSphereHitPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: skyAndSpherePipelineLayout
-      , compute: assembleSkyAndSphereHitStage
-      , label: "assembleSkyAndSphereHitPipeline"
-      }
-    skyHitBatchedStage <- liftEffect $ makeSkyHitStage device BatchedHits
-    skyHitBatchedPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: skyShadingPipelineLayout
-      , compute: skyHitBatchedStage
-      , label: "skyHitBatchedPipeline"
-      }
-    skyHitScatteredStage <- liftEffect $ makeSkyHitStage device ScatteredHits
-    skyHitScatteredPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: skyShadingPipelineLayout
-      , compute: skyHitScatteredStage
-      , label: "skyHitScatteredPipeline"
-      }
-    sphereHitBatchedStage <- liftEffect $ makeSphereHitStage device BatchedHits
-    sphereHitBatchedPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: sphereShadingPipelineLayout
-      , compute: sphereHitBatchedStage
-      , label: "sphereHitBatchedPipeline"
-      }
-    sphereHitScatteredStage <- liftEffect $ makeSphereHitStage device ScatteredHits
-    sphereHitScatteredPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: sphereShadingPipelineLayout
-      , compute: sphereHitScatteredStage
-      , label: "sphereHitScatteredStage"
-      }
-    assembleRawColorsPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: assembleRawColorsPipelineLayout
-      , compute: assembleRawColorsStage
-      , label: "assembleRawColorsPipeline"
-      }
-    let
-      (config :: GPUCanvasConfiguration) = x
-        { device
-        , format: GPUTextureFormat.bgra8unorm
-        , usage:
-            GPUTextureUsage.renderAttachment .|. GPUTextureUsage.copyDst
-        , alphaMode: opaque
+            , label: "w4BindGroupLayout"
+            }
+      slowBvhBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.readOnlyStorage }
+                        :: GPUBufferBindingLayout
+                    )
+                ]
+            , label: "slowBvhBindGroupLayout"
+            }
+      bounceBvhBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                ]
+            , label: "bounceBvhBindGroupLayout"
+            }
+      quickBvhBindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
+                    (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
+                    ( x { type: GPUBufferBindingType.storage }
+                        :: GPUBufferBindingLayout
+                    )
+                ]
+            , label: "quickBvhBindGroupLayout"
+            }
+      let debugBindGroupLayout = wBindGroupLayout
+      readOPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
+        , label: "readOPipelineLayout"
         }
-    liftEffect $ configure context config
-    -- loopN <- liftEffect $ Ref.new 0
-    let
-      encodeCommands colorTexture = do
-        -- whichLoop <- Ref.modify (_ + 1) loopN
-        canvasWidth' <- width canvas
-        canvasHeight' <- height canvas
-        let canvasWidth = eightify canvasWidth'
-        let canvasHeight = eightify canvasHeight'
-        let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
-        let overshotWidth = bufferWidth / 4
-        tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
-        cf <- Ref.read currentFrame
-        Ref.write (cf + 1) currentFrame
-        commandEncoder <- createCommandEncoder device (x {})
-        let workgroupOvershootX = ceil (toNumber overshotWidth / 16.0)
-        let workgroupOvershootY = ceil (toNumber canvasHeight / 16.0)
-        let workgroupXForIndirectPartition = ceil (toNumber (canvasWidth * canvasHeight) / toNumber (4 * 64))
-        let workgroupX = ceil (toNumber canvasWidth / 16.0)
-        let workgroupY = ceil (toNumber canvasHeight / 16.0)
-        cinfo <- fromArray $ map fromInt
-          [ canvasWidth
-          , overshotWidth
-          , canvasHeight
-          , nSpheres
-          , nBVHNodes
-          , canvasWidth * canvasHeight
-          , 0
-          , 0
-          , 0
-          , 0
-          , 0
-          , 0
-          ]
-        let aspect = toNumber canvasWidth / toNumber canvasHeight
-        let ambitus_x = if aspect < 1.0 then 2.0 else 2.0 * aspect
-        let ambitus_y = if aspect >= 1.0 then 2.0 else 2.0 * aspect
-        let lower_left_x = -ambitus_x / 2.0
-        let lower_left_y = -ambitus_y / 2.0
-        let lower_left_z = -1.0
-        let asBuffer = buffer cinfo
-        whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 6)
-          [ fromNumber' ambitus_x
-          , fromNumber' ambitus_y
-          , fromNumber' lower_left_x
-          , fromNumber' lower_left_y
-          , fromNumber' lower_left_z
-          , fromNumber' tn
-          ]
-        logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition, ambitus_x, ambitus_y }
-        writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
-        -- not necessary in the loop, but useful as a stress test for animating positions
-        computePassEncoder <- beginComputePass commandEncoder (x {})
-        -- set reader for all computations
-        GPUComputePassEncoder.setBindGroup computePassEncoder 0
-          readerBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          debugBindGroup
-        -----------------------
-        -- clear canvas
-        GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wCanvasBindGroup
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupOvershootX workgroupOvershootY 1
-        -----------------------
-        -- set ray & xyz buffer
-        -- debugged
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wInitialPartitionsEvenBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-        foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 4 BounceRun)) \(Tuple idx runType) -> do
+      readOOPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, wBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
+        , label: "readOOPipelineLayout"
+        }
+      skyAndSpherePipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ rBindGroupLayout, wBindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
+        , label: "skyAndSpherePipelineLayout"
+        }
+      partitionInitialRaysAndXYZsBindGroupLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, w4BindGroupLayout, debugBindGroupLayout ]
+        , label: "partitionInitialRaysAndXYZsBindGroupLayout"
+        }
+      quickBvhPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, quickBvhBindGroupLayout ]
+        , label: "quickBvhPipelineLayout"
+        }
+      slowBvhPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, slowBvhBindGroupLayout ]
+        , label: "slowBvhPipelineLayout"
+        }
+      bounceBvhPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ readerBindGroupLayout, bounceBvhBindGroupLayout ]
+        , label: "bounceBvhPipelineLayout"
+        }
+      -- technically the sky shader doesn't need to write to bvh info as we're done with bounces
+      -- but as changing it to read-only would require a layout switch we keep as write for now
+      -- makes code easier to maintain
+      skyShadingPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, rBindGroupLayout, debugBindGroupLayout ]
+        , label: "shadingPipelineLaout"
+        }
+      sphereShadingPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, r2BindGroupLayout, w2BindGroupLayout ]
+        , label: "sphereShadingPipelineLayout"
+        }
+      assembleRawColorsPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ r2BindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
+        , label: "assembleRawColorsPipelineLayout"
+        }
+      readerBindGroup <- createBindGroup device $ x
+        { layout: readerBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: sphereBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
+            ]
+        , label: "readerBindGroup"
+        }
+      wCanvasBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: wholeCanvasBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wCanvasBindGroup"
+        }
+      wIndirectBufferBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: indirectBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wIndirectBufferBindGroup"
+        }
+      wBvhInfoBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            ]
+        , label: "wBvhInfoBindGroup"
+        }
+      wRawColorBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wRawColorBindGroup"
+        }
+      shaderReaderEvenBindGroup <- createBindGroup device $ x
+        { layout: w1r2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
+            ]
+        , label: "shaderReaderEvenBindGroup"
+        }
+      shaderReaderOddBindGroup <- createBindGroup device $ x
+        { layout: w1r2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: rayOddBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
+            ]
+        , label: "shaderReaderEvenBindGroup"
+        }
+      shaderWriterOddBindGroup <- createBindGroup device $ x
+        { layout: w2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayOddBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
+            ]
+        , label: "shaderWriterOddBindGroup"
+        }
+      shaderWriterEvenBindGroup <- createBindGroup device $ x
+        { layout: w2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
+            ]
+        , label: "shaderWriterEvenBindGroup"
+        }
+      wInitialPartitionsEvenBindGroup <- createBindGroup device $ x
+        { layout: w4BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: ixBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 3
+                (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wInitialPartitionsBindGroup"
+        }
+      rBVHInfoBindGroup <- createBindGroup device $ x
+        { layout: rBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            ]
+        , label: "rBVHInfoBindGroup"
+        }
+      quickBvhBindGroup <- createBindGroup device $ x
+        { layout: quickBvhBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: sphereHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 3
+                (x { buffer: skyHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 4
+                (x { buffer: ixBuffer } :: GPUBufferBinding)
+            ]
+        , label: "quickBvhBindGroup"
+        }
+      slowBvhBindGroup <- createBindGroup device $ x
+        { layout: slowBvhBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: sphereHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 3
+                (x { buffer: skyHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 4
+                (x { buffer: ixBuffer } :: GPUBufferBinding)
+            ]
+        , label: "slowBvhBindGroup"
+        }
+      bounceBvhOddBindGroup <- createBindGroup device $ x
+        { layout: bounceBvhBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayOddBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: sphereHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 3
+                (x { buffer: skyHits } :: GPUBufferBinding)
+            ]
+        , label: "bounceBvhOddBindGroup"
+        }
+      bounceBvhEvenBindGroup <- createBindGroup device $ x
+        { layout: bounceBvhBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: bvhInfo } :: GPUBufferBinding)
+            , gpuBindGroupEntry 2
+                (x { buffer: sphereHits } :: GPUBufferBinding)
+            , gpuBindGroupEntry 3
+                (x { buffer: skyHits } :: GPUBufferBinding)
+            ]
+        , label: "bounceBvhEvenBindGroup"
+        }
+      wSkyHitIndirectBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: skyHitIndirectBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wSkyHitIndirectBindGroup"
+        }
+      wSphereHitIndirectBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: sphereHitIndirectBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wSphereHitIndirectBindGroup"
+        }
+      readSkyInfoBindGroup <- createBindGroup device $ x
+        { layout: rBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: skyHits } :: GPUBufferBinding)
+            ]
+        , label: "readSkyInfoBindGroup"
+        }
+      readSphereInfoBindGroup <- createBindGroup device $ x
+        { layout: r2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: sphereBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: sphereHits } :: GPUBufferBinding)
+            ]
+        , label: "readSphereInfoBindGroup"
+        }
+      assembleRawColorsReaderBindGroup <- createBindGroup device $ x
+        { layout: r2BindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
+            , gpuBindGroupEntry 1
+                (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "assembleRawColorsReaderBindGroup"
+        }
+      debugBindGroup <- createBindGroup device $ x
+        { layout: debugBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: debugBuffer } :: GPUBufferBinding)
+            ]
+        , label: "debugBindGroup"
+        }
+      --
+      zeroOutBufferPipeline <- createComputePipeline device $ x
+        { layout: readOPipelineLayout
+        , compute: zeroOutBufferStage
+        , label: "zeroOutBufferPipeline"
+        }
+      resetFirstIndirectBufferPipeline <- createComputePipeline device $ x
+        { layout: readOOPipelineLayout
+        , compute: resetFirstIndirectBufferStage
+        , label: "resetFirstIndirectBufferPipeline"
+        }
+      resetSecondIndirectBufferPipeline <- createComputePipeline device $ x
+        { layout: readOOPipelineLayout
+        , compute: resetSecondIndirectBufferStage
+        , label: "resetSecondIndirectBufferPipeline"
+        }
+      resetThirdIndirectBufferPipeline <- createComputePipeline device $ x
+        { layout: readOOPipelineLayout
+        , compute: resetThirdIndirectBufferStage
+        , label: "resetThirdIndirectBufferPipeline"
+        }
+      bvhQuickStage <- makeBVHStage device QuickBVH
+      bvhQuickPipeline <- createComputePipeline device $ x
+        { layout: quickBvhPipelineLayout
+        , compute: bvhQuickStage
+        , label: "bvhQuickPipeline"
+        }
+      bvhSlowStage <- makeBVHStage device SlowBVH
+      bvhSlowPipeline <- createComputePipeline device $ x
+        { layout: slowBvhPipelineLayout
+        , compute: bvhSlowStage
+        , label: "bvhSlowPipeline"
+        }
+      bvhBounceStage <- makeBVHStage device BounceBVH
+      bvhBouncePipeline <- createComputePipeline device $ x
+        { layout: bounceBvhPipelineLayout
+        , compute: bvhBounceStage
+        , label: "bvhBouncePipeline"
+        }
+      assembleSkyAndSphereHitPipeline <- createComputePipeline device $ x
+        { layout: skyAndSpherePipelineLayout
+        , compute: assembleSkyAndSphereHitStage
+        , label: "assembleSkyAndSphereHitPipeline"
+        }
+      skyHitBatchedStage <- makeSkyHitStage device BatchedHits
+      skyHitBatchedPipeline <- createComputePipeline device $ x
+        { layout: skyShadingPipelineLayout
+        , compute: skyHitBatchedStage
+        , label: "skyHitBatchedPipeline"
+        }
+      skyHitScatteredStage <- makeSkyHitStage device ScatteredHits
+      skyHitScatteredPipeline <- createComputePipeline device $ x
+        { layout: skyShadingPipelineLayout
+        , compute: skyHitScatteredStage
+        , label: "skyHitScatteredPipeline"
+        }
+      sphereHitBatchedStage <- makeSphereHitStage device BatchedHits
+      sphereHitBatchedPipeline <- createComputePipeline device $ x
+        { layout: sphereShadingPipelineLayout
+        , compute: sphereHitBatchedStage
+        , label: "sphereHitBatchedPipeline"
+        }
+      sphereHitScatteredStage <- makeSphereHitStage device ScatteredHits
+      sphereHitScatteredPipeline <- createComputePipeline device $ x
+        { layout: sphereShadingPipelineLayout
+        , compute: sphereHitScatteredStage
+        , label: "sphereHitScatteredStage"
+        }
+      assembleRawColorsPipeline <- createComputePipeline device $ x
+        { layout: assembleRawColorsPipelineLayout
+        , compute: assembleRawColorsStage
+        , label: "assembleRawColorsPipeline"
+        }
+      let
+        (config :: GPUCanvasConfiguration) = x
+          { device
+          , format: GPUTextureFormat.bgra8unorm
+          , usage:
+              GPUTextureUsage.renderAttachment .|. GPUTextureUsage.copyDst
+          , alphaMode: opaque
+          }
+      configure context config
+      partitionPipelines <- (0 .. 4) # traverse (makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device)
+      -- loopN <- Ref.new 0
+      let
+        encodeCommands colorTexture = do
+          -- whichLoop <- Ref.modify (_ + 1) loopN
+          canvasWidth' <- width canvas
+          canvasHeight' <- height canvas
+          let canvasWidth = eightify canvasWidth'
+          let canvasHeight = eightify canvasHeight'
+          let bufferWidth = ceil (toNumber canvasWidth * 4.0 / 256.0) * 256
+          let overshotWidth = bufferWidth / 4
+          tn <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
+          cf <- Ref.read currentFrame
+          Ref.write (cf + 1) currentFrame
+          commandEncoder <- createCommandEncoder device (x {})
+          let workgroupOvershootX = ceil (toNumber overshotWidth / 16.0)
+          let workgroupOvershootY = ceil (toNumber canvasHeight / 16.0)
+          let workgroupXForIndirectPartition = ceil (toNumber (canvasWidth * canvasHeight) / toNumber (4 * 64))
+          let workgroupX = ceil (toNumber canvasWidth / 16.0)
+          let workgroupY = ceil (toNumber canvasHeight / 16.0)
+          cinfo <- fromArray $ map fromInt
+            [ canvasWidth
+            , overshotWidth
+            , canvasHeight
+            , nSpheres
+            , nBVHNodes
+            , canvasWidth * canvasHeight
+            , 0
+            , 0
+            , 0
+            , 0
+            , 0
+            , 0
+            ]
+          let aspect = toNumber canvasWidth / toNumber canvasHeight
+          let ambitus_x = if aspect < 1.0 then 2.0 else 2.0 * aspect
+          let ambitus_y = if aspect >= 1.0 then 2.0 else 2.0 * aspect
+          let lower_left_x = -ambitus_x / 2.0
+          let lower_left_y = -ambitus_y / 2.0
+          let lower_left_z = -1.0
+          let asBuffer = buffer cinfo
+          whole asBuffer >>= \(x :: Float32Array) -> void $ set x (Just 6)
+            [ fromNumber' ambitus_x
+            , fromNumber' ambitus_y
+            , fromNumber' lower_left_x
+            , fromNumber' lower_left_y
+            , fromNumber' lower_left_z
+            , fromNumber' tn
+            ]
+          logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition, ambitus_x, ambitus_y }
+          writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
+          -- not necessary in the loop, but useful as a stress test for animating positions
+          computePassEncoder <- beginComputePass commandEncoder (x {})
+            -- set reader for all computations
+          GPUComputePassEncoder.setBindGroup computePassEncoder 0
+            readerBindGroup
+          GPUComputePassEncoder.setBindGroup computePassEncoder 2
+            debugBindGroup
           -----------------------
-          -- set indirect buffer
-          when (runType /= QuickRun) do
+          -- clear canvas
+          GPUComputePassEncoder.setPipeline computePassEncoder zeroOutBufferPipeline
+          GPUComputePassEncoder.setBindGroup computePassEncoder 1
+            wCanvasBindGroup
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupOvershootX workgroupOvershootY 1
+          foreachE (A.take 1 partitionPipelines) \partitionInitialRaysAndXYZsPipeline -> do
+            -- set reader for all computations
             GPUComputePassEncoder.setBindGroup computePassEncoder 0
               readerBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              debugBindGroup
+            -----------------------
+            -- set ray & xyz buffer
+            -- debugged
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              wInitialPartitionsEvenBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
+            foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 0 BounceRun)) \(Tuple idx runType) -> do
+              -----------------------
+              -- set indirect buffer
+              when (runType /= QuickRun) do
+                GPUComputePassEncoder.setBindGroup computePassEncoder 0
+                  readerBindGroup
 
-          GPUComputePassEncoder.setBindGroup computePassEncoder 1
-            wIndirectBufferBindGroup
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            wBvhInfoBindGroup
-          GPUComputePassEncoder.setBindGroup computePassEncoder 3
-            debugBindGroup
-          GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-            QuickRun -> resetFirstIndirectBufferPipeline
-            SlowRun -> resetSecondIndirectBufferPipeline
-            BounceRun -> resetThirdIndirectBufferPipeline
-          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+              GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                wIndirectBufferBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                wBvhInfoBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 3
+                debugBindGroup
+              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+                QuickRun -> resetFirstIndirectBufferPipeline
+                SlowRun -> resetSecondIndirectBufferPipeline
+                BounceRun -> resetThirdIndirectBufferPipeline
+              GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+              -----------------------
+              -- do bvh
+              GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                debugBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 1 $ case runType of
+                QuickRun -> quickBvhBindGroup
+                SlowRun -> slowBvhBindGroup
+                BounceRun -> case idx `mod` 2 of
+                  0 -> bounceBvhOddBindGroup
+                  _ -> bounceBvhEvenBindGroup
+              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+                QuickRun -> bvhQuickPipeline
+                SlowRun -> bvhSlowPipeline
+                BounceRun -> bvhBouncePipeline
+              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder indirectBuffer 0
+              -----------------------
+              -- assemble coloring info
+              GPUComputePassEncoder.setBindGroup computePassEncoder 0
+                rBVHInfoBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                wSkyHitIndirectBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                wSphereHitIndirectBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 3
+                debugBindGroup
+              GPUComputePassEncoder.setPipeline computePassEncoder
+                assembleSkyAndSphereHitPipeline
+              GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+              -----------------------
+              -- reader for all shading
+              GPUComputePassEncoder.setBindGroup computePassEncoder 0 $ case runType of
+                QuickRun -> shaderReaderEvenBindGroup
+                SlowRun -> shaderReaderEvenBindGroup
+                -- bounces need to start with the odd bind group
+                -- because our first pass is actually two passes, quick bvh then slow
+                BounceRun -> case idx `mod` 2 of
+                  0 -> shaderReaderOddBindGroup
+                  _ -> shaderReaderEvenBindGroup
+              GPUComputePassEncoder.setBindGroup computePassEncoder 1
+                wRawColorBindGroup
+              -----------------------
+              -- color sky
+              GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                readSkyInfoBindGroup
+              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+                QuickRun -> skyHitBatchedPipeline
+                SlowRun -> skyHitScatteredPipeline
+                BounceRun -> skyHitScatteredPipeline
+              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
+              -- color spheres
+              GPUComputePassEncoder.setBindGroup computePassEncoder 2
+                readSphereInfoBindGroup
+              case runType of
+                QuickRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
+                SlowRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
+                -- on stage 2 (the first bounce stage, we are writing to even)
+                BounceRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 $ case idx `mod` 2 of
+                  0 -> shaderWriterEvenBindGroup
+                  _ -> shaderWriterOddBindGroup
+              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+                QuickRun -> sphereHitBatchedPipeline
+                SlowRun -> sphereHitScatteredPipeline
+                BounceRun -> sphereHitScatteredPipeline
+              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
           -----------------------
-          -- do bvh
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            debugBindGroup
-          GPUComputePassEncoder.setBindGroup computePassEncoder 1 $ case runType of
-            QuickRun -> quickBvhBindGroup
-            SlowRun -> slowBvhBindGroup
-            BounceRun -> case idx `mod` 2 of
-              0 -> bounceBvhOddBindGroup
-              _ -> bounceBvhEvenBindGroup
-          GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-            QuickRun -> bvhQuickPipeline
-            SlowRun -> bvhSlowPipeline
-            BounceRun -> bvhBouncePipeline
-          GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder indirectBuffer 0
-          -----------------------
-          -- assemble coloring info
+          -- merge anti-alias passes
           GPUComputePassEncoder.setBindGroup computePassEncoder 0
-            rBVHInfoBindGroup
+            assembleRawColorsReaderBindGroup
           GPUComputePassEncoder.setBindGroup computePassEncoder 1
-            wSkyHitIndirectBindGroup
+            wCanvasBindGroup
           GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            wSphereHitIndirectBindGroup
-          GPUComputePassEncoder.setBindGroup computePassEncoder 3
             debugBindGroup
           GPUComputePassEncoder.setPipeline computePassEncoder
-            assembleSkyAndSphereHitPipeline
-          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+            assembleRawColorsPipeline
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
           -----------------------
-          -- reader for all shading
-          GPUComputePassEncoder.setBindGroup computePassEncoder 0 $ case runType of
-            QuickRun -> shaderReaderEvenBindGroup
-            SlowRun -> shaderReaderEvenBindGroup
-            -- bounces need to start with the odd bind group
-            -- because our first pass is actually two passes, quick bvh then slow
-            BounceRun -> case idx `mod` 2 of
-              0 -> shaderReaderOddBindGroup
-              _ -> shaderReaderEvenBindGroup
-          GPUComputePassEncoder.setBindGroup computePassEncoder 1
-            wRawColorBindGroup
-          -----------------------
-          -- color sky
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            readSkyInfoBindGroup
-          GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-            QuickRun -> skyHitBatchedPipeline
-            SlowRun -> skyHitScatteredPipeline
-            BounceRun -> skyHitScatteredPipeline
-          GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
-          -- color spheres
-          GPUComputePassEncoder.setBindGroup computePassEncoder 2
-            readSphereInfoBindGroup
-          case runType of
-            QuickRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
-            SlowRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
-            -- on stage 2 (the first bounce stage, we are writing to even)
-            BounceRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 $ case idx `mod` 2 of
-              0 -> shaderWriterEvenBindGroup
-              _ -> shaderWriterOddBindGroup
-          GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-            QuickRun -> sphereHitBatchedPipeline
-            SlowRun -> sphereHitScatteredPipeline
-            BounceRun -> sphereHitScatteredPipeline
-          GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
-        -----------------------
-        -- merge anti-alias passes
-        GPUComputePassEncoder.setBindGroup computePassEncoder 0
-          assembleRawColorsReaderBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wCanvasBindGroup
-        GPUComputePassEncoder.setBindGroup computePassEncoder 2
-          debugBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder
-          assembleRawColorsPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
-        -----------------------
-        -- fin
-        GPUComputePassEncoder.end computePassEncoder
-        copyBufferToTexture
-          commandEncoder
-          (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
-          (x { texture: colorTexture })
-          (gpuExtent3DWH canvasWidth' canvasHeight')
-        copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
-        toSubmit <- finish commandEncoder
-        submit queue [ toSubmit ]
-        let debugCondition = true -- whichLoop == 100
-        launchAff_ do
-          toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
-          liftEffect do
-            when debugCondition do
-              bfr <- getMappedRange debugOutputBuffer
-              buffy <- (Typed.whole bfr :: Effect Float32Array) >>= Typed.toArray
-              let _ = spy "buffy" buffy
-              unmap debugOutputBuffer
-            tnx <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
-            cfx <- Ref.read currentFrame
-            avgTime <- timeDeltaAverager (tnx - tn)
-            avgFrame <- frameDeltaAverager (toNumber (cfx - cf))
-            pushFrameInfo { avgTime, avgFrame }
-    let
-      render = unit # fix \f _ -> do
-        cw <- clientWidth (toElement canvas)
-        ch <- clientHeight (toElement canvas)
-        setWidth (floor cw) canvas
-        setHeight (floor ch) canvas
-        colorTexture <- getCurrentTexture context
-        encodeCommands colorTexture
-        -- window >>= void <<< requestAnimationFrame (f unit)
+          -- fin
+          GPUComputePassEncoder.end computePassEncoder
+          copyBufferToTexture
+            commandEncoder
+            (x { buffer: wholeCanvasBuffer, bytesPerRow: bufferWidth })
+            (x { texture: colorTexture })
+            (gpuExtent3DWH canvasWidth' canvasHeight')
+          copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
+          toSubmit <- finish commandEncoder
+          submit queue [ toSubmit ]
+          let debugCondition = true -- whichLoop == 100
+          launchAff_ do
+            toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
+            liftEffect do
+              when debugCondition do
+                bfr <- getMappedRange debugOutputBuffer
+                buffy <- (Typed.whole bfr :: Effect Float32Array) >>= Typed.toArray
+                let _ = spy "buffy" buffy
+                unmap debugOutputBuffer
+              tnx <- (getTime >>> (_ - startsAt) >>> (_ * 0.001)) <$> now
+              cfx <- Ref.read currentFrame
+              avgTime <- timeDeltaAverager (tnx - tn)
+              avgFrame <- frameDeltaAverager (toNumber (cfx - cf))
+              pushFrameInfo { avgTime, avgFrame }
+      let
+        render = unit # fix \f _ -> do
+          cw <- clientWidth (toElement canvas)
+          ch <- clientHeight (toElement canvas)
+          setWidth (floor cw) canvas
+          setHeight (floor ch) canvas
+          colorTexture <- getCurrentTexture context
+          encodeCommands colorTexture
+      -- window >>= void <<< requestAnimationFrame (f unit)
 
-    liftEffect render
+      liftEffect render
 
 main :: Effect Unit
 main = do
