@@ -7,7 +7,7 @@ import Control.Lazy (fix)
 import Control.Monad.Gen (elements)
 import Control.Promise (toAffE)
 import Control.Promise as Control.Promise
-import Data.Array (intercalate, length, replicate, (..))
+import Data.Array (fold, intercalate, length, replicate, (..))
 import Data.Array.NonEmpty (NonEmptyArray, cons', drop, fromNonEmpty, snoc, snoc', sortBy, take, toArray, uncons)
 import Data.Array.NonEmpty as NEA
 import Data.ArrayBuffer.ArrayBuffer (byteLength)
@@ -24,6 +24,7 @@ import Data.Int.Bits (complement, (.&.))
 import Data.JSDate (getTime, now)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Monoid (guard)
 import Data.Newtype (class Newtype, unwrap)
 import Data.NonEmpty (NonEmpty(..))
 import Data.Traversable (sequence, traverse)
@@ -67,7 +68,7 @@ import Web.GPU.GPUDevice (GPUDevice, createBindGroup, createBindGroupLayout, cre
 import Web.GPU.GPUDevice as GPUDevice
 import Web.GPU.GPUExtent3D (gpuExtent3DWH)
 import Web.GPU.GPUMapMode as GPUMapMode
-import Web.GPU.GPUProgrammableStage (GPUProgrammableStage)
+import Web.GPU.GPUProgrammableStage (GPUProgrammableStage(..))
 import Web.GPU.GPUQueue (onSubmittedWorkDone, submit, writeBuffer)
 import Web.GPU.GPUShaderStage as GPUShaderStage
 import Web.GPU.GPUTextureFormat as GPUTextureFormat
@@ -172,6 +173,11 @@ struct sky_hit_info {
 }
 struct sphere_hit_info {
   t: f32,
+  sphere_ix: u32,
+  ix: u32
+}
+struct hit_outcome {
+  was_hit: u32,
   sphere_ix: u32,
   ix: u32
 }
@@ -300,7 +306,8 @@ bvhInfoAtomic =
 struct bvh_info_atomic {
   n_total: u32,
   n_hits: atomic<u32>,
-  n_misses: atomic<u32>
+  n_misses: atomic<u32>,
+  n_redos: atomic<u32>
 }
 """
 
@@ -310,7 +317,8 @@ bvhInfoNonAtomic =
 struct bvh_info_non_atomic {
   n_total: u32,
   n_hits: u32,
-  n_misses: u32
+  n_misses: u32,
+  n_redos: u32
 }
 """
 
@@ -494,6 +502,27 @@ fn main() {
   bvh_info.n_total = rendering_info.cwch;
   bvh_info.n_hits = 0u;
   bvh_info.n_misses = 0u;
+  bvh_info.n_redos = 0u;
+}
+  """
+
+setSecondIndirectBuffer :: String
+setSecondIndirectBuffer =
+  """
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read_write> indirection : vec3<u32>;
+@group(2) @binding(0) var<storage, read_write> bvh_info : bvh_info_non_atomic;
+//@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
+@compute @workgroup_size(1, 1, 1)
+fn main() {
+  var xv = bvh_info.n_redos / y_axis_stride;
+  indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == bvh_info.n_redos);
+  indirection.y = 4u;
+  indirection.z = 1u;
+  bvh_info.n_total = bvh_info.n_redos;
+  bvh_info.n_hits = 0u;
+  bvh_info.n_misses = 0u;
+  bvh_info.n_redos = 0u;
 }
   """
 
@@ -523,9 +552,11 @@ fn main() {
 }
   """
 
-skyHitShader :: String
-skyHitShader =
-  """
+data ShaderRun = BatchedHits | ScatteredHits
+
+skyHitShader :: { shaderRun :: ShaderRun } -> String
+skyHitShader { shaderRun } = fold
+  [ """
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> bvh_info : bvh_info_non_atomic;
 @group(0) @binding(2) var<storage, read> rays : array<ray>;
@@ -534,21 +565,32 @@ skyHitShader =
 @group(2) @binding(0) var<storage, read> sky_hits : array<sky_hit_info>;
 @group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 64, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
   var ix = global_id.x * y_axis_stride + global_id.y;
   if (ix > bvh_info.n_misses) {
     return;
   }
+  """
+  , case shaderRun of
+      BatchedHits ->
+        """
+  var sky_hit = sky_hits[ix / 64];
+  var real_ix = sky_hit.ix + local_id.y;
+  var ray = rays[real_ix];
+  var xyz = xyzs[real_ix];
+  """
+      ScatteredHits ->
+        """
   var sky_hit = sky_hits[ix];
   var ray = rays[sky_hit.ix];
-  var color = sky_color(&ray);
   var xyz = xyzs[sky_hit.ix];
+    """
+  , """
+  
+  var color = sky_color(&ray);
   var adjusted_ix = rendering_info.real_canvas_width * xyz.y + xyz.x;
   switch xyz.z {
     case 0u: {
-        if (xyz.x == 42 && xyz.y == 42) {
-        debug[6] += 1;
-      }
       colors[adjusted_ix].r0 *= color.r;
       colors[adjusted_ix].g0 *= color.g;
       colors[adjusted_ix].b0 *= color.b;
@@ -577,10 +619,14 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   }
 }
   """
+  ]
 
-sphereHitShader :: String
-sphereHitShader =
-  """
+sphereHitShader :: { shaderRun :: ShaderRun } -> String
+sphereHitShader { shaderRun } = fold
+  [ """
+const t_min = 0.0001;
+const t_max = 10000.f;
+
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(0) @binding(1) var<storage, read> bvh_info : bvh_info_non_atomic;
 @group(0) @binding(2) var<storage, read> rays : array<ray>;
@@ -590,19 +636,54 @@ sphereHitShader =
 @group(2) @binding(1) var<storage, read> sphere_hits : array<sphere_hit_info>;
 @group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 64, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
   var ix = global_id.x * y_axis_stride + global_id.y;
   if (ix > bvh_info.n_hits) {
     return;
   }
+  """
+  , case shaderRun of
+      BatchedHits ->
+        """
+  var sphere_hit = sphere_hits[ix / 64];
+  var real_ix = sphere_hit.ix + local_id.y;
+  var ray = rays[real_ix];
+  var xyz = xyzs[real_ix];
+  """
+      ScatteredHits ->
+        """
   var sphere_hit = sphere_hits[ix];
   var ray = rays[sphere_hit.ix];
-  var sphere_offset = sphere_hit.sphere_ix * 4;
-  var norm_t = sphere_hit.t;
-  var rec: hit_record;
-  _ = make_hit_rec(sphere_info[sphere_offset], sphere_info[sphere_offset + 1], sphere_info[sphere_offset + 2], sphere_info[sphere_offset + 3], norm_t, &ray, &rec);
-  var color = hit_color(&ray, &rec);
   var xyz = xyzs[sphere_hit.ix];
+    """
+  , """
+  var sphere_offset = sphere_hit.sphere_ix * 4;
+  var h0 = sphere_info[sphere_offset];
+  var h1 = sphere_info[sphere_offset + 1];
+  var h2 = sphere_info[sphere_offset + 2];
+  var h3 = sphere_info[sphere_offset + 3];
+  """
+  , case shaderRun of
+      BatchedHits ->
+        """
+  // in batched mode, we do not know where the hit happens
+  // so we need to calculate it here
+  var norm_t: f32;
+  hit_sphere(
+        h0, h1, h2, h3,
+        &ray,
+        t_min,
+        t_max,
+        &norm_t);
+  """
+      ScatteredHits ->
+        """
+  var norm_t = sphere_hit.t;  
+    """
+  , """
+  var rec: hit_record;
+  _ = make_hit_rec(h0, h1, h2, h3, norm_t, &ray, &rec);
+  var color = hit_color(&ray, &rec);
   var adjusted_ix = rendering_info.real_canvas_width * xyz.y + xyz.x;
   switch xyz.z {
     case 0u: {
@@ -642,6 +723,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   }
 }
   """
+  ]
 
 assembleRawColorsShader :: String
 assembleRawColorsShader =
@@ -660,12 +742,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var rc = raw_color_arary[idx];
   // random test for anti-aliasing, should work...
 
-  if (rc.g0 == 1.f) {
-    color_arary[overshot_idx] = pack4x8unorm(vec4(
-        1.f,0.f,0.f,
-        1.f));
-  }
-  else if (rc.b1 == 1.f && rc.g2 == 1.f && rc.r3 == 1.f) {
+  if (rc.b1 == 1.f && rc.g2 == 1.f && rc.r3 == 1.f) {
       color_arary[overshot_idx] = pack4x8unorm(vec4(
         rc.b0,
         rc.g0,
@@ -681,10 +758,23 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 }
   """
 
-bvhComputeBody :: String
-bvhComputeBody =
-  """
+data BVHRun = QuickBVH | SlowBVH | BounceBVH
+
+bvhComputeBody :: { bvhRun :: BVHRun } -> String
+bvhComputeBody { bvhRun } = fold
+  [ """
 // main
+
+"""
+
+  , case bvhRun of
+      QuickBVH ->
+        """
+// we store outcomes in a workgroup variable and check them at the end
+var<workgroup> outcomes: array<hit_outcome, 64>;
+  """
+      _ -> ""
+  , """
 
 const t_min = 0.0001;
 const t_max = 10000.f;
@@ -692,130 +782,298 @@ const t_max = 10000.f;
 @group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
 @group(0) @binding(2) var<storage, read> bvh_nodes : array<bvh_node>;
 @group(1) @binding(0) var<storage, read> rays : array<ray>;
-@group(1) @binding(1) var<storage, read> ixs : array<u32>;
-@group(1) @binding(2) var<storage, read_write> bvh_info: bvh_info_atomic;
-@group(1) @binding(3) var<storage, read_write> sphere_hit : array<sphere_hit_info>;
-@group(1) @binding(4) var<storage, read_write> sky_hit : array<sky_hit_info>;
+@group(1) @binding(1) var<storage, read_write> bvh_info: bvh_info_atomic;
+@group(1) @binding(2) var<storage, read_write> sphere_hit : array<sphere_hit_info>;
+@group(1) @binding(3) var<storage, read_write> sky_hit : array<sky_hit_info>;
+"""
 
+  , case bvhRun of
+      QuickBVH ->
+        """
+@group(1) @binding(4) var<storage, read_write> ixs : array<u32>; // write in quick bvh
+  """
+      _ ->
+        """
+@group(1) @binding(4) var<storage, read> ixs : array<u32>;
+"""
+  , """
 @compute @workgroup_size(1, 64, 1)
-fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
   ////////////////////////////////////////
   ////////////////////////////////////////
   var lookup = global_id.x * y_axis_stride + global_id.y;
-  if (lookup >= bvh_info.n_total) {
-    return;
-  }
-  var ix = ixs[lookup];
-  var ray = rays[ix];
-  var hit: f32;
-  var sphere_ix: u32;
-  var bvh_read_playhead: u32;
-  var bvh_write_playhead: u32;
-  var sphere_read_playhead: u32;
-  var sphere_write_playhead: u32;
-  var bvh_ixs: array<u32, 64>;
-  var sphere_ixs: array<u32, 64>;
+  var lookup_mod4 = lookup % 4;
+  var ix: u32;
+  if (lookup < bvh_info.n_total) {
+  """
+  , case bvhRun of
+      QuickBVH ->
+        """
+    // in quick bvh, we look at the four corners only
+    var initial_lookup = lookup;
+    lookup = ((lookup / 4) * 64) + select(select(select(63u, 54u, lookup_mod4 == 2u), 7u, lookup_mod4 == 1u) , 0u, lookup_mod4 == 0u);
+    // we're reading directly into a buffer that has been pre-sorted in units of 64, so we can do a direct lookup to get the corners
+    ix = lookup;
+  """
+      SlowBVH ->
+        """
+    // in slow bvh, we're doing an entire bloc of 64
+    // so we first get the overall index and then add the correct thread position to it
+    ix = ixs[lookup / 64] + (lookup % 64);
+        """
+      BounceBVH ->
+        """
+    // the data is unsorted, so we need to lookup the correct index
+    ix = ixs[lookup];
+    """
+  , """
+    var ray = rays[ix];
+    var hit: f32;
+    var sphere_ix: u32;
+    var bvh_read_playhead: u32;
+    var bvh_write_playhead: u32;
+    var sphere_read_playhead: u32;
+    var sphere_write_playhead: u32;
+    var bvh_ixs: array<u32, 64>;
+    var sphere_ixs: array<u32, 64>;
 
-  ////////////////////////////////////////
-  ////////////////////////////////////////
-  var last_node_ix = rendering_info.n_bvh_nodes - 1;
+    ////////////////////////////////////////
+    ////////////////////////////////////////
+    var last_node_ix = rendering_info.n_bvh_nodes - 1;
 
-  ////////////////////////////////////////
-  var last_node = bvh_nodes[last_node_ix];
-  hit = 1000.f;
-  sphere_ix = 0u;
-  if (last_node.is_sphere == 1u) {
-    sphere_ixs[0] = last_node_ix;
-    sphere_write_playhead = 1u;
-  } else {
-    bvh_ixs[0] = last_node_ix;
-    bvh_write_playhead = 1u;
-  }
-  sphere_read_playhead = 0u;
-  bvh_read_playhead = 0u;
-  var currentBVH = bvh_write_playhead - bvh_read_playhead;
-  var currentSphere = sphere_write_playhead - sphere_read_playhead;
-  var is_done = false;
-  loop {
-    if (is_done) {
-      break;
+    ////////////////////////////////////////
+    var last_node = bvh_nodes[last_node_ix];
+    hit = 1000.f;
+    sphere_ix = 0u;
+    if (last_node.is_sphere == 1u) {
+      sphere_ixs[0] = last_node_ix;
+      sphere_write_playhead = 1u;
+    } else {
+      bvh_ixs[0] = last_node_ix;
+      bvh_write_playhead = 1u;
     }
-    var starting_bvh_write_playhead = bvh_write_playhead;
-    var starting_sphere_write_playhead = sphere_write_playhead;
-    // bvh
-    if (starting_bvh_write_playhead > bvh_read_playhead) {
-      var bloc = bvh_ixs[bvh_read_playhead % 64];
-      var node = bvh_nodes[bloc];
-      var bbox: aabb;
-      bvh_node_bounding_box(&node, &bbox);
-      var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
-      /////
-      if (was_aabb_hit) {
-        if (bvh_nodes[node.left].is_sphere == 1u) {
-          sphere_ixs[sphere_write_playhead % 64] = node.left;
-          sphere_write_playhead++;
-        } else {
-          bvh_ixs[(bvh_write_playhead) % 64] = node.left;
-          bvh_write_playhead++;
-        }
-        if (bvh_nodes[node.right].is_sphere == 1u) {
-          sphere_ixs[(sphere_write_playhead) % 64] = node.right;
-          sphere_write_playhead++;
-        } else {
-          bvh_ixs[(bvh_write_playhead) % 64] = node.right;
-          bvh_write_playhead++;
-        }
+    sphere_read_playhead = 0u;
+    bvh_read_playhead = 0u;
+    var currentBVH = bvh_write_playhead - bvh_read_playhead;
+    var currentSphere = sphere_write_playhead - sphere_read_playhead;
+    var is_done = false;
+    loop {
+      if (is_done) {
+        break;
       }
-      bvh_read_playhead += 1;
+      var starting_bvh_write_playhead = bvh_write_playhead;
+      var starting_sphere_write_playhead = sphere_write_playhead;
+      // bvh
+      if (starting_bvh_write_playhead > bvh_read_playhead) {
+        var bloc = bvh_ixs[bvh_read_playhead % 64];
+        var node = bvh_nodes[bloc];
+        var bbox: aabb;
+        bvh_node_bounding_box(&node, &bbox);
+        var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
+        /////
+        if (was_aabb_hit) {
+          if (bvh_nodes[node.left].is_sphere == 1u) {
+            sphere_ixs[sphere_write_playhead % 64] = node.left;
+            sphere_write_playhead++;
+          } else {
+            bvh_ixs[(bvh_write_playhead) % 64] = node.left;
+            bvh_write_playhead++;
+          }
+          if (bvh_nodes[node.right].is_sphere == 1u) {
+            sphere_ixs[(sphere_write_playhead) % 64] = node.right;
+            sphere_write_playhead++;
+          } else {
+            bvh_ixs[(bvh_write_playhead) % 64] = node.right;
+            bvh_write_playhead++;
+          }
+        }
+        bvh_read_playhead += 1;
+      }
+      //////////////////////////////////////////////////////
+      //////////////////////////////////////////////////////
+      //////////////////////////////////////////////////////
+      //////////////////////////////////////////////////////
+      //////////////////////////////////////////////////////
+      if (starting_sphere_write_playhead > sphere_read_playhead) {
+        // sphere
+        var sloc = sphere_ixs[(sphere_read_playhead) % 64];
+        var node = bvh_nodes[sloc];
+        var hit_t: f32;
+        var sphere_test = node.left * 4u;
+        var sphere_hit = hit_sphere(
+          sphere_info[sphere_test],
+          sphere_info[sphere_test+1],
+          sphere_info[sphere_test+2],
+          sphere_info[sphere_test+3],
+          &ray,
+          t_min,
+          t_max,
+          &hit_t);
+        var i_plus_1 = node.left + 1u;
+        var old_t = hit;
+        var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
+        hit = new_t;
+        var old_ix = sphere_ix;
+        sphere_ix =
+          select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
+        sphere_read_playhead += 1;
+      }
+      is_done = (sphere_write_playhead == sphere_read_playhead) && (bvh_write_playhead == bvh_read_playhead);
     }
-    //////////////////////////////////////////////////////
-    //////////////////////////////////////////////////////
-    //////////////////////////////////////////////////////
-    //////////////////////////////////////////////////////
-    //////////////////////////////////////////////////////
-    if (starting_sphere_write_playhead > sphere_read_playhead) {
-      // sphere
-      var sloc = sphere_ixs[(sphere_read_playhead) % 64];
-      var node = bvh_nodes[sloc];
-      var hit_t: f32;
-      var sphere_test = node.left * 4u;
-      var sphere_hit = hit_sphere(
-        sphere_info[sphere_test],
-        sphere_info[sphere_test+1],
-        sphere_info[sphere_test+2],
-        sphere_info[sphere_test+3],
-        &ray,
-        t_min,
-        t_max,
-        &hit_t);
-      var i_plus_1 = node.left + 1u;
-      var old_t = hit;
-      var new_t = select(old_t, select(old_t, hit_t, hit_t < old_t), sphere_hit);
-      hit = new_t;
-      var old_ix = sphere_ix;
-      sphere_ix =
-        select(old_ix, select(old_ix, i_plus_1, new_t != old_t), sphere_hit);
-      sphere_read_playhead += 1;
-    }
-    is_done = (sphere_write_playhead == sphere_read_playhead) && (bvh_write_playhead == bvh_read_playhead);
-  }
 
-  var i_was_hit  = sphere_ix > 0u;
-  if (i_was_hit) {
-    var i = atomicAdd(&bvh_info.n_hits, 1u);
-    var hit_info: sphere_hit_info;
-    hit_info.t = hit;
-    hit_info.sphere_ix = sphere_ix - 1;
-    hit_info.ix = ix;
-    sphere_hit[i] = hit_info;
-  } else {
-    var i = atomicAdd(&bvh_info.n_misses, 1u);
-    var hit_info: sky_hit_info;
-    hit_info.ix = ix;
-    sky_hit[i] = hit_info;
+    var i_was_hit  = sphere_ix > 0u;
+  """
+  , case bvhRun of
+      QuickBVH ->
+        """
+    if (i_was_hit) {
+      var outcome: hit_outcome;
+      outcome.sphere_ix = sphere_ix - 1;
+      outcome.ix = ix;
+      outcome.was_hit = 1u;
+      outcomes[local_id.y] = outcome;
+    } else {
+      var outcome: hit_outcome;
+      outcome.sphere_ix = 0xffffffffu;
+      outcome.ix = ix;
+      outcome.was_hit = 0u;
+      outcomes[local_id.y] = outcome;
+    }
+    // we put a workgroup barrier in place to make sure that
+    // the computation is complete up until this point, as we're about to triage based on the results
+    // one of three things is possible here:
+    // - we hit a sphere
+    // - we hit the sky
+    // - we hit both and we need to rerun stuff
+  }
+  workgroupBarrier();
+  if (lookup < bvh_info.n_total) {
+    // only mod4 threads will actually write to arrays
+    if (lookup_mod4 != 0u) { return; }
+    var res0 = outcomes[local_id.y];
+    var res1 = outcomes[local_id.y + 1];
+    var res2 = outcomes[local_id.y + 2];
+    var res3 = outcomes[local_id.y + 3];
+    if (res0.was_hit == 0u && res1.was_hit == 0u && res2.was_hit == 0u && res3.was_hit == 0u) {
+      var i = atomicAdd(&bvh_info.n_misses, 64u);
+      var hit_info: sky_hit_info;
+      hit_info.ix = ix; // ix will always be the head of a workgroup of 64
+      sky_hit[i / 64u] = hit_info;
+    } else if (res0.was_hit == 1u && res0.sphere_ix == res1.sphere_ix && res0.sphere_ix == res2.sphere_ix && res0.sphere_ix == res3.sphere_ix) {
+      var i = atomicAdd(&bvh_info.n_hits, 64u);
+      var hit_info: sphere_hit_info;
+      hit_info.t = -1.f; // we do not record hits in quick bvh, as they'll need to be computed in the coloring shader
+      hit_info.sphere_ix = res0.sphere_ix;
+      hit_info.ix = ix; // ix will always be the head of a workgroup of 64
+      sphere_hit[i / 64u] = hit_info;
+    } else {
+      var i = atomicAdd(&bvh_info.n_redos, 64u);
+      ixs[i / 64u] = ix;
+    }
+  }
+}
+  """
+      _ ->
+        """
+    if (i_was_hit) {
+      var i = atomicAdd(&bvh_info.n_hits, 1u);
+      var hit_info: sphere_hit_info;
+      hit_info.t = hit;
+      hit_info.sphere_ix = sphere_ix - 1;
+      hit_info.ix = ix;
+      sphere_hit[i] = hit_info;
+    } else {
+      var i = atomicAdd(&bvh_info.n_misses, 1u);
+      var hit_info: sky_hit_info;
+      hit_info.ix = ix;
+      sky_hit[i] = hit_info;
+    }
   }
 }
 """
+  ]
+
+makeBVHStage :: GPUDevice -> BVHRun -> Effect GPUProgrammableStage
+makeBVHStage device bvhRun = do
+  let
+    bvhDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , fuzzable
+            , ray
+            , yAxisStride
+            , usefulConsts
+            , bvhInfoAtomic
+            , hitInfo
+            , bvhNode
+            , aabb
+            , hitSphere
+            , bvhComputeBody { bvhRun }
+            ]
+      }
+  bvhModule <- createShaderModule device bvhDesc
+  pure $ x
+    { "module": bvhModule
+    , entryPoint: "main"
+    }
+
+makeSkyHitStage :: GPUDevice -> ShaderRun -> Effect GPUProgrammableStage
+makeSkyHitStage device shaderRun = do
+  let
+    skyHitDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , fuzzable
+            , ray
+            , bvhInfoNonAtomic
+            , lerp
+            , lerpv
+            , yAxisStride
+            , usefulConsts
+            , hitInfo
+            , hitRecord
+            , calcColors
+            , aliasedColor
+            , skyHitShader { shaderRun }
+            ]
+      }
+  skyHitModule <- liftEffect $ createShaderModule device skyHitDesc
+  pure $ x
+    { "module": skyHitModule
+    , entryPoint: "main"
+    }
+
+makeSphereHitStage :: GPUDevice -> ShaderRun -> Effect GPUProgrammableStage
+makeSphereHitStage device shaderRun = do
+  let
+    sphereHitDesc = x
+      { code:
+          intercalate "\n"
+            [ inputData
+            , fuzzable
+            , bvhInfoNonAtomic
+            , ray
+            , lerp
+            , lerpv
+            , yAxisStride
+            , usefulConsts
+            , hitInfo
+            , hitRecord
+            , calcColors
+            , aliasedColor
+            , makeHitRec
+            , hitSphere
+            , pointAtParameter
+            , sphereHitShader { shaderRun }
+            ]
+      }
+  sphereHitModule <- liftEffect $ createShaderModule device sphereHitDesc
+  pure $ x
+    { "module": sphereHitModule
+    , entryPoint: "main"
+    }
 
 eightify :: Int -> Int
 eightify i = if x == i then i else x + 8
@@ -1075,23 +1333,23 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copySrc .|. GPUBufferUsage.storage
       }
     ixBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+      { size: deviceLimits.maxStorageBufferBindingSize / 16
       , usage: GPUBufferUsage.storage
       }
     xyzBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+      { size: deviceLimits.maxStorageBufferBindingSize / 4
       , usage: GPUBufferUsage.storage
       }
     rayBuffer <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+      { size: deviceLimits.maxStorageBufferBindingSize / 4
       , usage: GPUBufferUsage.storage
       }
     skyHits <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+      { size: deviceLimits.maxStorageBufferBindingSize / 16
       , usage: GPUBufferUsage.storage
       }
     sphereHits <- liftEffect $ createBuffer device $ x
-      { size: deviceLimits.maxStorageBufferBindingSize
+      { size: deviceLimits.maxStorageBufferBindingSize / 16
       , usage: GPUBufferUsage.storage
       }
     indirectBuffer <- liftEffect $ createBuffer device $ x
@@ -1111,7 +1369,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
       }
     bvhInfo <- liftEffect $ createBuffer device $ x
-      { size: 12
+      { size: 16
       , usage: GPUBufferUsage.storage
       }
 
@@ -1137,7 +1395,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         , entryPoint: "main"
         }
     let
-      resetIndirectBufferDesc = x
+      resetFirstIndirectBufferDesc = x
         { code:
             intercalate "\n"
               [ inputData
@@ -1146,10 +1404,26 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , setFirstIndirectBuffer
               ]
         }
-    resetIndirectBufferModule <- liftEffect $ createShaderModule device resetIndirectBufferDesc
+    resetFirstIndirectBufferModule <- liftEffect $ createShaderModule device resetFirstIndirectBufferDesc
     let
-      (resetIndirectBufferStage :: GPUProgrammableStage) = x
-        { "module": resetIndirectBufferModule
+      (resetFirstIndirectBufferStage :: GPUProgrammableStage) = x
+        { "module": resetFirstIndirectBufferModule
+        , entryPoint: "main"
+        }
+    let
+      resetSecondIndirectBufferDesc = x
+        { code:
+            intercalate "\n"
+              [ inputData
+              , bvhInfoNonAtomic
+              , yAxisStride
+              , setSecondIndirectBuffer
+              ]
+        }
+    resetSecondIndirectBufferModule <- liftEffect $ createShaderModule device resetSecondIndirectBufferDesc
+    let
+      (resetSecondIndirectBufferStage :: GPUProgrammableStage) = x
+        { "module": resetSecondIndirectBufferModule
         , entryPoint: "main"
         }
     let
@@ -1185,81 +1459,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let
       (partitionInitialRaysAndXYZsStage :: GPUProgrammableStage) = x
         { "module": partitionInitialRaysAndXYZsModule
-        , entryPoint: "main"
-        }
-    let
-      bvhDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , fuzzable
-              , ray
-              , yAxisStride
-              , usefulConsts
-              , bvhInfoAtomic
-              , hitInfo
-              , bvhNode
-              , aabb
-              , hitSphere
-              , bvhComputeBody
-              ]
-        }
-    bvhModule <- liftEffect $ createShaderModule device bvhDesc
-    let
-      (bvhStage :: GPUProgrammableStage) = x
-        { "module": bvhModule
-        , entryPoint: "main"
-        }
-    let
-      skyHitDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , fuzzable
-              , ray
-              , bvhInfoNonAtomic
-              , lerp
-              , lerpv
-              , yAxisStride
-              , usefulConsts
-              , hitInfo
-              , hitRecord
-              , calcColors
-              , aliasedColor
-              , skyHitShader
-              ]
-        }
-    skyHitModule <- liftEffect $ createShaderModule device skyHitDesc
-    let
-      (skyHitStage :: GPUProgrammableStage) = x
-        { "module": skyHitModule
-        , entryPoint: "main"
-        }
-    let
-      sphereHitDesc = x
-        { code:
-            intercalate "\n"
-              [ inputData
-              , fuzzable
-              , bvhInfoNonAtomic
-              , ray
-              , lerp
-              , lerpv
-              , yAxisStride
-              , usefulConsts
-              , hitInfo
-              , hitRecord
-              , calcColors
-              , aliasedColor
-              , makeHitRec
-              , pointAtParameter
-              , sphereHitShader
-              ]
-        }
-    sphereHitModule <- liftEffect $ createShaderModule device sphereHitDesc
-    let
-      (sphereHitStage :: GPUProgrammableStage) = x
-        { "module": sphereHitModule
         , entryPoint: "main"
         }
     let
@@ -1422,23 +1621,41 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
                 )
           , label: "w4BindGroupLayout"
           }
-    bvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
+    slowBvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
       $ x
           { entries:
               [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
-                  ( x { type: GPUBufferBindingType.readOnlyStorage }
-                      :: GPUBufferBindingLayout
-                  )
-              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
                   (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
+              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
               , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
                   (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
               , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
                   (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
               , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
-                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+                  ( x { type: GPUBufferBindingType.readOnlyStorage }
+                      :: GPUBufferBindingLayout
+                  )
               ]
-          , label: "bvhBindGroupLayout"
+          , label: "slowBvhBindGroupLayout"
+          }
+    quickBvhBindGroupLayout <- liftEffect $ createBindGroupLayout device
+      $ x
+          { entries:
+              [ gpuBindGroupLayoutEntry 0 GPUShaderStage.compute
+                  (x { type: GPUBufferBindingType.readOnlyStorage } :: GPUBufferBindingLayout)
+              , gpuBindGroupLayoutEntry 1 GPUShaderStage.compute
+                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+              , gpuBindGroupLayoutEntry 2 GPUShaderStage.compute
+                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+              , gpuBindGroupLayoutEntry 3 GPUShaderStage.compute
+                  (x { type: GPUBufferBindingType.storage } :: GPUBufferBindingLayout)
+              , gpuBindGroupLayoutEntry 4 GPUShaderStage.compute
+                  ( x { type: GPUBufferBindingType.storage }
+                      :: GPUBufferBindingLayout
+                  )
+              ]
+          , label: "quickBvhBindGroupLayout"
           }
     let debugBindGroupLayout = wBindGroupLayout
     readOPipelineLayout <- liftEffect $ createPipelineLayout device $ x
@@ -1457,9 +1674,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       { bindGroupLayouts: [ readerBindGroupLayout, w4BindGroupLayout, debugBindGroupLayout ]
       , label: "partitionInitialRaysAndXYZsBindGroupLayout"
       }
-    bvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
-      { bindGroupLayouts: [ readerBindGroupLayout, bvhBindGroupLayout ]
-      , label: "bvhPipelineLayout"
+    quickBvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, quickBvhBindGroupLayout ]
+      , label: "quickBvhPipelineLayout"
+      }
+    slowBvhPipelineLayout <- liftEffect $ createPipelineLayout device $ x
+      { bindGroupLayouts: [ readerBindGroupLayout, slowBvhBindGroupLayout ]
+      , label: "slowBvhPipelineLayout"
       }
     skyShadingPipelineLayout <- liftEffect $ createPipelineLayout device $ x
       { bindGroupLayouts: [ r4BindGroupLayout, wBindGroupLayout, rBindGroupLayout, debugBindGroupLayout ]
@@ -1553,22 +1774,39 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           ]
       , label: "rBVHInfoBindGroup"
       }
-    bvhBindGroup <- liftEffect $ createBindGroup device $ x
-      { layout: bvhBindGroupLayout
+    quickBvhBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: quickBvhBindGroupLayout
       , entries:
           [ gpuBindGroupEntry 0
               (x { buffer: rayBuffer } :: GPUBufferBinding)
           , gpuBindGroupEntry 1
-              (x { buffer: ixBuffer } :: GPUBufferBinding)
-          , gpuBindGroupEntry 2
               (x { buffer: bvhInfo } :: GPUBufferBinding)
-          , gpuBindGroupEntry 3
+          , gpuBindGroupEntry 2
               (x { buffer: sphereHits } :: GPUBufferBinding)
-          , gpuBindGroupEntry 4
+          , gpuBindGroupEntry 3
               (x { buffer: skyHits } :: GPUBufferBinding)
+          , gpuBindGroupEntry 4
+              (x { buffer: ixBuffer } :: GPUBufferBinding)
           ]
-      , label: "bvhBindGroup"
+      , label: "quickBvhBindGroup"
       }
+    slowBvhBindGroup <- liftEffect $ createBindGroup device $ x
+      { layout: slowBvhBindGroupLayout
+      , entries:
+          [ gpuBindGroupEntry 0
+              (x { buffer: rayBuffer } :: GPUBufferBinding)
+          , gpuBindGroupEntry 1
+              (x { buffer: bvhInfo } :: GPUBufferBinding)
+          , gpuBindGroupEntry 2
+              (x { buffer: sphereHits } :: GPUBufferBinding)
+          , gpuBindGroupEntry 3
+              (x { buffer: skyHits } :: GPUBufferBinding)
+          , gpuBindGroupEntry 4
+              (x { buffer: ixBuffer } :: GPUBufferBinding)
+          ]
+      , label: "slowBvhBindGroup"
+      }
+    let bounceBvhBindGroup = slowBvhBindGroup
     wSkyHitIndirectBindGroup <- liftEffect $ createBindGroup device $ x
       { layout: wBindGroupLayout
       , entries:
@@ -1627,35 +1865,68 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
       , compute: zeroOutBufferStage
       , label: "zeroOutBufferPipeline"
       }
-    resetIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
+    resetFirstIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: readOOPipelineLayout
-      , compute: resetIndirectBufferStage
-      , label: "resetIndirectBufferPipeline"
+      , compute: resetFirstIndirectBufferStage
+      , label: "resetFirstIndirectBufferPipeline"
+      }
+    resetSecondIndirectBufferPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: readOOPipelineLayout
+      , compute: resetSecondIndirectBufferStage
+      , label: "resetSecondIndirectBufferPipeline"
       }
     partitionInitialRaysAndXYZsPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: partitionInitialRaysAndXYZsBindGroupLayout
       , compute: partitionInitialRaysAndXYZsStage
       , label: "partitionInitialRaysAndXYZsPipeline"
       }
-    bvhPipeline <- liftEffect $ createComputePipeline device $ x
-      { layout: bvhPipelineLayout
-      , compute: bvhStage
-      , label: "bvhPipeline"
+    bvhQuickStage <- liftEffect $ makeBVHStage device QuickBVH
+    bvhQuickPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: quickBvhPipelineLayout
+      , compute: bvhQuickStage
+      , label: "bvhQuickPipeline"
+      }
+    bvhSlowStage <- liftEffect $ makeBVHStage device SlowBVH
+    bvhSlowPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: slowBvhPipelineLayout
+      , compute: bvhSlowStage
+      , label: "bvhSlowPipeline"
+      }
+    bvhBounceStage <- liftEffect $ makeBVHStage device BounceBVH
+    let bouncBvhPipelineLayout = slowBvhPipelineLayout
+    bvhBouncePipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: bouncBvhPipelineLayout
+      , compute: bvhBounceStage
+      , label: "bvhBouncePipeline"
       }
     assembleSkyAndSphereHitPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: skyAndSpherePipelineLayout
       , compute: assembleSkyAndSphereHitStage
       , label: "assembleSkyAndSphereHitPipeline"
       }
-    skyHitPipeline <- liftEffect $ createComputePipeline device $ x
+    skyHitBatchedStage <- liftEffect $ makeSkyHitStage device BatchedHits
+    skyHitBatchedPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: skyShadingPipelineLayout
-      , compute: skyHitStage
-      , label: "skyHitPipeline"
+      , compute: skyHitBatchedStage
+      , label: "skyHitBatchedPipeline"
       }
-    sphereHitPipeline <- liftEffect $ createComputePipeline device $ x
+    skyHitScatteredStage <- liftEffect $ makeSkyHitStage device ScatteredHits
+    skyHitScatteredPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: skyShadingPipelineLayout
+      , compute: skyHitScatteredStage
+      , label: "skyHitScatteredPipeline"
+      }
+    sphereHitBatchedStage <- liftEffect $ makeSphereHitStage device BatchedHits
+    sphereHitBatchedPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: sphereShadingPipelineLayout
-      , compute: sphereHitStage
-      , label: "sphereHitPipeline"
+      , compute: sphereHitBatchedStage
+      , label: "sphereHitBatchedPipeline"
+      }
+    sphereHitScatteredStage <- liftEffect $ makeSphereHitStage device ScatteredHits
+    sphereHitScatteredPipeline <- liftEffect $ createComputePipeline device $ x
+      { layout: sphereShadingPipelineLayout
+      , compute: sphereHitScatteredStage
+      , label: "sphereHitScatteredStage"
       }
     assembleRawColorsPipeline <- liftEffect $ createComputePipeline device $ x
       { layout: assembleRawColorsPipelineLayout
@@ -1735,6 +2006,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           wCanvasBindGroup
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupOvershootX workgroupOvershootY 1
         -----------------------
+        -- set ray & xyz buffer
+        -- debugged
+        GPUComputePassEncoder.setBindGroup computePassEncoder 1
+          wInitialPartitionsBindGroup
+        GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
+        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
+        -----------------------
         -- set indirect buffer
         -- debugged
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
@@ -1743,23 +2021,16 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           wBvhInfoBindGroup
         GPUComputePassEncoder.setBindGroup computePassEncoder 3
           debugBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder resetIndirectBufferPipeline
+        GPUComputePassEncoder.setPipeline computePassEncoder resetFirstIndirectBufferPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
         -----------------------
-        -- set ray & xyz buffer
-        -- debugged
-        GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          wInitialPartitionsBindGroup
+        -- do bvh
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           debugBindGroup
-        GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
-        GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-        -----------------------
-        -- do bvh
         GPUComputePassEncoder.setBindGroup computePassEncoder 1
-          bvhBindGroup
+          bounceBvhBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
-          bvhPipeline
+          bvhBouncePipeline
         GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder indirectBuffer 0
         -----------------------
         -- assemble coloring info
@@ -1785,13 +2056,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           readSkyInfoBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
-          skyHitPipeline
+          skyHitScatteredPipeline
         GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
         -- color spheres
         GPUComputePassEncoder.setBindGroup computePassEncoder 2
           readSphereInfoBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder
-          sphereHitPipeline
+          sphereHitScatteredPipeline
         GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
         -----------------------
         -- merge anti-alias passes
@@ -1837,7 +2108,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         setHeight (floor ch) canvas
         colorTexture <- getCurrentTexture context
         encodeCommands colorTexture
-        -- window >>= void <<< requestAnimationFrame (f unit)
+    -- window >>= void <<< requestAnimationFrame (f unit)
 
     liftEffect render
 
