@@ -300,6 +300,26 @@ struct hit_record {
 }
       """
 
+pseudoRandom :: String
+pseudoRandom = """
+fn pseudo_random(co:vec2<f32>) -> f32{
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+const pi = 3.141592653589793;
+const two_pi = 2.0 * pi;
+fn random_in_unit_sphere(r0: vec2<f32>, r1: vec2<f32>) -> vec3<f32> {
+  var phi = two_pi * pseudo_random(r0);
+  var theta = two_pi * pseudo_random(r1);
+  var sinphi = sin(phi);
+  var cosphi = cos(phi);
+  var sintheta = sin(theta);
+  var costheta = cos(theta);
+  var x = sinphi * costheta;
+  var y = sinphi * sintheta;
+  var z = cosphi;
+  return vec3(x, y, z);
+}
+"""
 bvhInfoAtomic :: String
 bvhInfoAtomic =
   """
