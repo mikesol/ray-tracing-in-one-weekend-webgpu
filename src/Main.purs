@@ -736,7 +736,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   , """
   var rec: hit_record;
   _ = make_hit_rec(h0, h1, h2, h3, norm_t, &r, &rec);
-  var color = vec3(0.5f, 0.5f, 0.5f);//hit_color(&r, &rec);
+  var color = hit_color(&r, &rec);
   ////////////////////////
   // bounce!
   var tgt = rec.p + rec.normal + random_in_unit_sphere(vec2(rec.p.x, rec.p.y), vec2(rec.p.y, rec.p.z));
@@ -802,15 +802,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 
   if (rc.b1 == 1.f && rc.g2 == 1.f && rc.r3 == 1.f) {
       color_arary[overshot_idx] = pack4x8unorm(vec4(
-        rc.b0,
-        rc.g0,
-        rc.r0,
+        sqrt(rc.b0),
+        sqrt(rc.g0),
+        sqrt(rc.r0),
         1.f));
   } else {
     color_arary[overshot_idx] = pack4x8unorm(vec4(
-      (rc.b0 + rc.b1 + rc.b2 + rc.b3 + rc.b4) / 5.f, 
-      (rc.g0 + rc.g1 + rc.g2 + rc.g3 + rc.g4) / 5.f,
-      (rc.r0 + rc.r1 + rc.r2 + rc.r3 + rc.r4) / 5.f, 1.f));
+      sqrt((rc.b0 + rc.b1 + rc.b2 + rc.b3 + rc.b4) / 5.f), 
+      sqrt((rc.g0 + rc.g1 + rc.g2 + rc.g3 + rc.g4) / 5.f),
+      sqrt((rc.r0 + rc.r1 + rc.r2 + rc.r3 + rc.r4) / 5.f), 1.f));
   }
 }
   """
@@ -1370,7 +1370,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
       }
     seed <- liftEffect $ randomInt 42 42424242
-    randos <- liftEffect $ sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
+    randos <- liftEffect $ sequence $ replicate 0 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
     let
       spheres =
         cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -2176,7 +2176,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           wInitialPartitionsEvenBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-        foreachE (mapWithIndex Tuple [ QuickRun, SlowRun, BounceRun ]) \(Tuple idx runType) -> do
+        foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 4 BounceRun)) \(Tuple idx runType) -> do
           -----------------------
           -- set indirect buffer
           when (runType /= QuickRun) do
@@ -2280,7 +2280,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
         toSubmit <- finish commandEncoder
         submit queue [ toSubmit ]
-        let debugCondition = false -- whichLoop == 100
+        let debugCondition = true -- whichLoop == 100
         launchAff_ do
           toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
           liftEffect do
@@ -2302,7 +2302,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         setHeight (floor ch) canvas
         colorTexture <- getCurrentTexture context
         encodeCommands colorTexture
-        window >>= void <<< requestAnimationFrame (f unit)
+        -- window >>= void <<< requestAnimationFrame (f unit)
 
     liftEffect render
 
