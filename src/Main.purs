@@ -805,7 +805,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   ////////////////////////////////////////
   ////////////////////////////////////////
   var lookup = global_id.x * y_axis_stride + global_id.y;
-  var lookup_mod4 = lookup % 4;
+  var lookup_mod4 = local_id.y % 4;
   var ix: u32;
   if (lookup < bvh_info.n_total) {
   """
@@ -814,7 +814,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
         """
     // in quick bvh, we look at the four corners only
     var initial_lookup = lookup;
-    lookup = ((lookup / 4) * 64) + select(select(select(63u, 54u, lookup_mod4 == 2u), 7u, lookup_mod4 == 1u) , 0u, lookup_mod4 == 0u);
+    lookup = ((initial_lookup / 4) * 64) + select(select(select(63u, 56u, lookup_mod4 == 2u), 7u, lookup_mod4 == 1u) , 0u, lookup_mod4 == 0u);
     // we're reading directly into a buffer that has been pre-sorted in units of 64, so we can do a direct lookup to get the corners
     ix = lookup;
   """
@@ -822,7 +822,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
         """
     // in slow bvh, we're doing an entire bloc of 64
     // so we first get the overall index and then add the correct thread position to it
-    ix = ixs[lookup / 64] + (lookup % 64);
+    ix = ixs[lookup / 64] + local_id.y;
         """
       BounceBVH ->
         """
