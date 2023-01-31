@@ -510,13 +510,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   ac.g4 = 1.f;
   ac.b4 = 1.f;
   raw_colors[lookup] = ac;
-  //if (lookup == 65) {
-  //  debug[0] = f32(ixs[lookup]);
-  //  debug[1] = f32(current_grid_x);
-  //  debug[2] = f32(current_grid_y);
-  //  debug[3] = f32(rays[lookup].direction.x);
-  //  debug[4] = f32(place_in_64);
-  //}
 }
   """
 
@@ -526,7 +519,7 @@ setFirstIndirectBuffer =
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> indirection : vec3<u32>;
 @group(2) @binding(0) var<storage, read_write> bvh_info : bvh_info_non_atomic;
-//@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
+@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 1, 1)
 fn main() {
   // we multiply the stride by 16 because we are only considering the outermost 4 pixels
@@ -551,7 +544,7 @@ setSecondIndirectBuffer =
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> indirection : vec3<u32>;
 @group(2) @binding(0) var<storage, read_write> bvh_info : bvh_info_non_atomic;
-//@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
+@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 1, 1)
 fn main() {
   var xv = bvh_info.n_redos / y_axis_stride;
@@ -574,9 +567,10 @@ setThirdIndirectBuffer =
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> indirection : vec3<u32>;
 @group(2) @binding(0) var<storage, read_write> bvh_info : bvh_info_non_atomic;
-//@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
+@group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 1, 1)
 fn main() {
+  debug[0] = f32(bvh_info.n_next_bounce);
   var xv = bvh_info.n_next_bounce / y_axis_stride;
   indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == bvh_info.n_next_bounce);
   indirection.y = 4u;
@@ -607,12 +601,6 @@ fn main() {
   sphere_hit.x = select(x_sphere + 1, x_sphere, x_sphere * y_axis_stride == bvh_info.n_hits);
   sphere_hit.y = 4u;
   sphere_hit.z = 1u;
-  debug[0] = f32(sky_hit.x);
-  debug[1] = f32(sky_hit.y);
-  debug[2] = f32(sky_hit.z);
-  debug[3] = f32(sphere_hit.x);
-  debug[4] = f32(sphere_hit.y);
-  debug[5] = f32(sphere_hit.z);
 }
   """
 
@@ -819,11 +807,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
         rc.r0,
         1.f));
   } else {
-  debug[22] = 55565.f;
-  color_arary[overshot_idx] = pack4x8unorm(vec4(
-    (rc.b0 + rc.b1 + rc.b2 + rc.b3 + rc.b4) / 5.f, 
-    (rc.g0 + rc.g1 + rc.g2 + rc.g3 + rc.g4) / 5.f,
-    (rc.r0 + rc.r1 + rc.r2 + rc.r3 + rc.r4) / 5.f, 1.f));
+    color_arary[overshot_idx] = pack4x8unorm(vec4(
+      (rc.b0 + rc.b1 + rc.b2 + rc.b3 + rc.b4) / 5.f, 
+      (rc.g0 + rc.g1 + rc.g2 + rc.g3 + rc.g4) / 5.f,
+      (rc.r0 + rc.r1 + rc.r2 + rc.r3 + rc.r4) / 5.f, 1.f));
   }
 }
   """
@@ -2167,7 +2154,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           , fromNumber' lower_left_z
           , fromNumber' tn
           ]
-        -- logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition, ambitus_x, ambitus_y }
+        logShow { canvasWidth, canvasHeight, workgroupXForIndirectPartition, ambitus_x, ambitus_y }
         writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
         -- not necessary in the loop, but useful as a stress test for animating positions
         computePassEncoder <- beginComputePass commandEncoder (x {})
@@ -2189,7 +2176,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
           wInitialPartitionsEvenBindGroup
         GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
         GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-        foreachE (mapWithIndex Tuple [ QuickRun, SlowRun, BounceRun, BounceRun, BounceRun, BounceRun, BounceRun ]) \(Tuple idx runType) -> do
+        foreachE (mapWithIndex Tuple [ QuickRun, SlowRun, BounceRun ]) \(Tuple idx runType) -> do
           -----------------------
           -- set indirect buffer
           when (runType /= QuickRun) do
