@@ -576,8 +576,9 @@ setThirdIndirectBuffer =
 @compute @workgroup_size(1, 1, 1)
 fn main() {
   debug[0] = f32(bvh_info.n_next_bounce);
-  var xv = bvh_info.n_next_bounce / y_axis_stride;
-  indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == bvh_info.n_next_bounce);
+  var total_dispatches = bvh_info.n_next_bounce / 16;
+  var xv = total_dispatches / y_axis_stride;
+  indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
   indirection.y = 4u;
   indirection.z = 1u;
   bvh_info.n_total = bvh_info.n_next_bounce;
@@ -820,9 +821,10 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 }
   """
 
+data BVHRun' = QuickBVH' | SlowBVH'
 data BVHRun = QuickBVH | SlowBVH | BounceBVH
 
-bvhComputeBody :: { bvhRun :: BVHRun } -> String
+bvhComputeBody :: { bvhRun :: BVHRun' } -> String
 bvhComputeBody { bvhRun } = fold
   [ """
 // main
@@ -830,12 +832,12 @@ bvhComputeBody { bvhRun } = fold
 """
 
   , case bvhRun of
-      QuickBVH ->
+      QuickBVH' ->
         """
 // we store outcomes in a workgroup variable and check them at the end
 var<workgroup> outcomes: array<hit_outcome, 64>;
   """
-      _ -> ""
+      SlowBVH' -> ""
   , """
 
 const t_min = 0.0001;
@@ -850,15 +852,14 @@ const t_max = 10000.f;
 """
 
   , case bvhRun of
-      QuickBVH ->
+      QuickBVH' ->
         """
 @group(1) @binding(4) var<storage, read_write> ixs : array<u32>; // write in quick bvh
   """
-      SlowBVH ->
+      SlowBVH' ->
         """
 @group(1) @binding(4) var<storage, read> ixs : array<u32>;
 """
-      BounceBVH -> ""
   , """
 @compute @workgroup_size(1, 64, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
@@ -870,7 +871,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   if (lookup < bvh_info.n_total) {
   """
   , case bvhRun of
-      QuickBVH ->
+      QuickBVH' ->
         """
     // in quick bvh, we look at the four corners only
     var initial_lookup = lookup;
@@ -878,17 +879,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     // we're reading directly into a buffer that has been pre-sorted in units of 64, so we can do a direct lookup to get the corners
     ix = lookup;
   """
-      SlowBVH ->
+      SlowBVH' ->
         """
     // in slow bvh, we're doing an entire bloc of 64
     // so we first get the overall index and then add the correct thread position to it
     ix = ixs[lookup / 64] + local_id.y;
         """
-      BounceBVH ->
-        """
-    // the data is unsorted, so we need to lookup the correct index
-    ix = lookup;
-    """
   , """
     var ray = rays[ix];
     var hit: f32;
@@ -917,8 +913,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     }
     sphere_read_playhead = 0u;
     bvh_read_playhead = 0u;
-    var currentBVH = bvh_write_playhead - bvh_read_playhead;
-    var currentSphere = sphere_write_playhead - sphere_read_playhead;
     var is_done = false;
     loop {
       if (is_done) {
@@ -987,7 +981,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
     var i_was_hit  = sphere_ix > 0u;
   """
   , case bvhRun of
-      QuickBVH ->
+      QuickBVH' ->
         """
     if (i_was_hit) {
       var outcome: hit_outcome;
@@ -1036,7 +1030,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   }
 }
   """
-      _ ->
+      SlowBVH' ->
         """
     if (i_was_hit) {
       var i = atomicAdd(&bvh_info.n_hits, 1u);
@@ -1050,6 +1044,164 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
       var hit_info: sky_hit_info;
       hit_info.ix = ix;
       sky_hit[i] = hit_info;
+    }
+  }
+}
+"""
+  ]
+
+bvhComputeBounce ::  String
+bvhComputeBounce = fold
+  [ """
+// main
+var<workgroup> bvh_ix: atomic<u32>;
+var<workgroup> n_spheres: atomic<u32>;
+struct ix_vol {
+  ix: u32,
+  my_ix: u32,
+  vol: u32
+}
+// 1000 should be enough
+var<workgroup> ixvols: array<ix_vol, 1000>;
+// 1024 = 64 * 16 * 4
+var<workgroup> hits: array<atomic<u32>, 1024>;
+const bigggg = pack2x16float(vec2(0.f, 10000.f));
+const t_min = 0.0001;
+const t_max = 10000.f;
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(0) @binding(1) var<storage, read> sphere_info : array<f32>;
+@group(0) @binding(2) var<storage, read> bvh_nodes : array<bvh_node>;
+@group(1) @binding(0) var<storage, read> rays : array<ray>;
+@group(1) @binding(1) var<storage, read_write> bvh_info: bvh_info_atomic;
+@group(1) @binding(2) var<storage, read_write> sphere_hit : array<sphere_hit_info>;
+@group(1) @binding(3) var<storage, read_write> sky_hit : array<sky_hit_info>;
+@compute @workgroup_size(1, 64, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
+  ////////////////////////////////////////
+  ////////////////////////////////////////
+  var lookup = global_id.x * y_axis_stride + global_id.y;
+  var lookup_mod4 = local_id.y % 4;
+  var ix: u32;
+  var my_ix = atomicAdd(&bvh_ix, 1u);
+  var go_cond = lookup < bvh_info.n_total;
+  for (var ii = local_id.y; ii < 1024u; ii += 16) {
+    atomicStore(&hits[ii], bigggg);
+  }
+  var lookup_catapulted = (lookup / 64u) * 64u * 16u;
+  if (go_cond) {
+    loop {
+      // the data is unsorted, so we need to lookup the correct index
+      ix = lookup_catapulted + my_ix;
+      var ray = rays[ix];
+      var hit: f32;
+      var bvh_read_playhead: u32;
+      var bvh_write_playhead: u32;
+      var bvh_ixs: array<u32, 64>;
+
+      ////////////////////////////////////////
+      ////////////////////////////////////////
+      var last_node_ix = rendering_info.n_bvh_nodes - 1;
+
+      ////////////////////////////////////////
+      var last_node = bvh_nodes[last_node_ix];
+      hit = 1000.f;
+
+      bvh_ixs[0] = last_node_ix;
+      bvh_write_playhead = 1u;
+
+      bvh_read_playhead = 0u;
+      loop {
+        var starting_bvh_write_playhead = bvh_write_playhead;
+        // bvh
+        if (starting_bvh_write_playhead > bvh_read_playhead) {
+          var bloc = bvh_ixs[bvh_read_playhead % 64];
+          var node = bvh_nodes[bloc];
+          var bbox: aabb;
+          bvh_node_bounding_box(&node, &bbox);
+          var was_aabb_hit = aabb_hit(&bbox, &ray, t_min, t_max);
+          /////
+          if (was_aabb_hit) {
+            if (bvh_nodes[node.left].is_sphere == 1u) {
+              var nsp = atomicAdd(&n_spheres, 1u);
+              var ixv: ix_vol;
+              ixv.ix = ix;
+              ixv.my_ix = my_ix;
+              ixv.vol = node.left;
+              ixvols[nsp] = ixv;
+            } else {
+              bvh_ixs[(bvh_write_playhead) % 64] = node.left;
+              bvh_write_playhead++;
+            }
+            if (bvh_nodes[node.right].is_sphere == 1u) {
+              var nsp = atomicAdd(&n_spheres, 1u);
+              var ixv: ix_vol;
+              ixv.ix = ix;
+              ixv.my_ix = my_ix;
+              ixv.vol = node.right;
+              ixvols[nsp] = ixv;
+            } else {
+              bvh_ixs[(bvh_write_playhead) % 64] = node.right;
+              bvh_write_playhead++;
+            }
+          }
+          bvh_read_playhead += 1;
+          if (bvh_write_playhead == bvh_read_playhead) { break; }
+        }
+      }
+      my_ix = atomicAdd(&bvh_ix, 1u);
+      // 1024 = 64 * 16
+      if (my_ix >= 1024) { break; }
+    }
+  }
+  workgroupBarrier();
+  var ns = atomicLoad(&n_spheres);
+  if (go_cond) {
+    for (var ii = local_id.y; ii < 4096u; ii += 16u) {
+      if (ii >= ns) { break; }
+
+        // sphere
+        var ixv = ixvols[ii];
+        var ix = ixv.my_ix;
+        var sloc = ixv.vol;
+        var r = rays[ixv.ix];
+        var node = bvh_nodes[sloc];
+        var hit_t: f32;
+        var sphere_test = node.left * 4u;
+        var sphere_hit = hit_sphere(
+          sphere_info[sphere_test],
+          sphere_info[sphere_test+1],
+          sphere_info[sphere_test+2],
+          sphere_info[sphere_test+3],
+          &r,
+          t_min,
+          t_max,
+          &hit_t);
+        var i_plus_1 = node.left + 1u;
+        _ = atomicMin(&hits[my_ix], pack2x16float(vec2(f32(i_plus_1) + 0.02, hit_t)));
+    }
+  }
+  workgroupBarrier();
+  if (go_cond) {
+    for (var ii = local_id.y; ii < 1024u; ii += 16u) {
+        var unload = atomicLoad(&hits[ii]);
+        var unpack = unpack2x16float(unload);
+        var hit = unpack.y;
+        var sphere_ix = u32(unpack.x);
+        var ix = lookup_catapulted + ii;
+        var i_was_hit  = sphere_ix > 0u;
+        if (i_was_hit) {
+          var i = atomicAdd(&bvh_info.n_hits, 1u);
+          var hit_info: sphere_hit_info;
+          hit_info.t = hit;
+          hit_info.sphere_ix = sphere_ix - 1;
+          hit_info.ix = ix;
+          sphere_hit[i] = hit_info;
+        } else {
+          var i = atomicAdd(&bvh_info.n_misses, 1u);
+          var hit_info: sky_hit_info;
+          hit_info.ix = ix;
+          sky_hit[i] = hit_info;
+        }
     }
   }
 }
@@ -1072,7 +1224,10 @@ makeBVHStage device bvhRun = do
             , bvhNode
             , aabb
             , hitSphere
-            , bvhComputeBody { bvhRun }
+            , case bvhRun of
+                    QuickBVH -> bvhComputeBody { bvhRun: QuickBVH' }
+                    SlowBVH -> bvhComputeBody { bvhRun: SlowBVH' }
+                    BounceBVH -> bvhComputeBounce
             ]
       }
   bvhModule <- createShaderModule device bvhDesc
