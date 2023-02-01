@@ -576,9 +576,9 @@ setThirdIndirectBuffer =
 @compute @workgroup_size(1, 1, 1)
 fn main() {
   debug[0] = f32(bvh_info.n_next_bounce);
-  var total_dispatches = bvh_info.n_next_bounce / 64u; // 16;
+  var total_dispatches = bvh_info.n_next_bounce / 16u;
   var xv = total_dispatches / y_axis_stride;
-  indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
+  indirection.x = 1u; //select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
   indirection.y = 4u;
   indirection.z = 1u;
   bvh_info.n_total = bvh_info.n_next_bounce;
@@ -1080,7 +1080,6 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   ////////////////////////////////////////
   ////////////////////////////////////////
   var lookup = global_id.x * y_axis_stride + global_id.y;
-  var lookup_mod4 = local_id.y % 4;
   var ix: u32;
   var my_ix = atomicAdd(&bvh_ix, 1u);
   var go_cond = lookup < bvh_info.n_total;
