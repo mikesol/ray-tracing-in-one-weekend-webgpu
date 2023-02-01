@@ -518,6 +518,43 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   """
     ]
 
+diffusify :: String
+diffusify =
+  fold
+    [ """
+@group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
+@group(1) @binding(0) var<storage, read> in_colors : array<aliased_color>;
+@group(2) @binding(0) var<storage, read_write> out_colors : array<aliased_color>;
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  var lookup = global_id.x + global_id.y * rendering_info.real_canvas_width;
+  if (lookup >= rendering_info.cwch) {
+    return;
+  }
+  var ostr: aliased_color;
+  // we want each group of 64 threads to work on an 8x8 grid for the initial partition
+  var n = 0u;
+  for (var i = 0u; i < 9u; i++) {
+    var ix = lookup + ((i / 3 - 1) * rendering_info.real_canvas_width) + (i % 3 - 1);
+    if (ix < 0 || ix >= rendering_info.cwch) {
+      continue;
+    }
+    var c = in_colors[ix];
+    if (c.r0 != 1.0 && c.r0 != 1.0 && c.r0 != 1.0) {
+      n += 1u;
+      ostr.r0 += c.r0;
+      ostr.g0 += c.b0;
+      ostr.b0 += c.g0;
+    }
+  }
+  ostr.r0 /= f32(n);
+  ostr.g0 /= f32(n);
+  ostr.b0 /= f32(n);
+  out_colors[lookup] = ostr;
+}
+  """
+    ]
+
 setFirstIndirectBuffer :: String
 setFirstIndirectBuffer =
   """
@@ -1461,7 +1498,15 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , usage: GPUBufferUsage.storage .|. GPUBufferUsage.indirect
         }
       rawColorBuffer <- createBuffer device $ x
-        { size: deviceLimits.maxStorageBufferBindingSize
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      rawDiffusedColorBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
+        , usage: GPUBufferUsage.storage
+        }
+      rawSkyColorBuffer <- createBuffer device $ x
+        { size: deviceLimits.maxStorageBufferBindingSize / 4
         , usage: GPUBufferUsage.storage
         }
       skyHitIndirectBuffer <- createBuffer device $ x
@@ -1562,7 +1607,24 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           { "module": assembleSkyAndSphereHitModule
           , entryPoint: "main"
           }
-
+      let
+        diffusifyDesc = x
+          { code:
+              intercalate "\n"
+                [ inputData
+                , bvhInfoNonAtomic
+                , yAxisStride
+                , usefulConsts
+                , aliasedColor
+                , diffusify
+                ]
+          }
+      diffusifyModule <- createShaderModule device diffusifyDesc
+      let
+        (diffusifyStage :: GPUProgrammableStage) = x
+          { "module": diffusifyModule
+          , entryPoint: "main"
+          }
       let
         assembleRawColorsDesc = x
           { code:
@@ -1816,6 +1878,10 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         { bindGroupLayouts: [ r2BindGroupLayout, wBindGroupLayout, debugBindGroupLayout ]
         , label: "assembleRawColorsPipelineLayout"
         }
+      diffusifyPipelineLayout <- createPipelineLayout device $ x
+        { bindGroupLayouts: [ rBindGroupLayout, rBindGroupLayout, wBindGroupLayout ]
+        , label: "diffusifyPipelineLayout"
+        }
       readerBindGroup <- createBindGroup device $ x
         { layout: readerBindGroupLayout
         , entries:
@@ -1827,6 +1893,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
                 (x { buffer: bvhNodeBuffer } :: GPUBufferBinding)
             ]
         , label: "readerBindGroup"
+        }
+      canvasInfoBindGroup <- createBindGroup device $ x
+        { layout: rBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
+            ]
+        , label: "canvasInfoBindGroup"
         }
       wCanvasBindGroup <- createBindGroup device $ x
         { layout: wBindGroupLayout
@@ -1852,6 +1926,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             ]
         , label: "wBvhInfoBindGroup"
         }
+      wSkyRawColorsBindGroup <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rawSkyColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wSkyRawColorsBindGroup"
+        }
       wRawColorBindGroup <- createBindGroup device $ x
         { layout: wBindGroupLayout
         , entries:
@@ -1859,6 +1941,22 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
                 (x { buffer: rawColorBuffer } :: GPUBufferBinding)
             ]
         , label: "wRawColorBindGroup"
+        }
+      rRawColorBindGroup <- createBindGroup device $ x
+        { layout: rBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "rRawColorBindGroup"
+        }
+      wRawDiffusedColorBuffer <- createBindGroup device $ x
+        { layout: wBindGroupLayout
+        , entries:
+            [ gpuBindGroupEntry 0
+                (x { buffer: rawDiffusedColorBuffer } :: GPUBufferBinding)
+            ]
+        , label: "wRawDiffusedColorBuffer"
         }
       shaderReaderEvenBindGroup <- createBindGroup device $ x
         { layout: w1r2BindGroupLayout
@@ -2026,7 +2124,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             [ gpuBindGroupEntry 0
                 (x { buffer: canvasInfoBuffer } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
-                (x { buffer: rawColorBuffer } :: GPUBufferBinding)
+                (x { buffer: rawDiffusedColorBuffer } :: GPUBufferBinding)
             ]
         , label: "assembleRawColorsReaderBindGroup"
         }
@@ -2111,6 +2209,11 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         { layout: assembleRawColorsPipelineLayout
         , compute: assembleRawColorsStage
         , label: "assembleRawColorsPipeline"
+        }
+      diffusifyPipeline <- createComputePipeline device $ x
+        { layout: diffusifyPipelineLayout
+        , compute: diffusifyStage
+        , label: "diffusifyPipeline"
         }
       let
         (config :: GPUCanvasConfiguration) = x
@@ -2252,8 +2355,10 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
               BounceRun -> case idx `mod` 2 of
                 0 -> shaderReaderOddBindGroup
                 _ -> shaderReaderEvenBindGroup
-            GPUComputePassEncoder.setBindGroup computePassEncoder 1
-              wRawColorBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1 $ case runType of
+              QuickRun -> wSkyRawColorsBindGroup
+              SlowRun -> wSkyRawColorsBindGroup
+              BounceRun -> wRawColorBindGroup
             -----------------------
             -- color sky
             GPUComputePassEncoder.setBindGroup computePassEncoder 2
@@ -2264,6 +2369,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
               BounceRun -> skyHitScatteredPipeline
             GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
             -- color spheres
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1 wRawColorBindGroup
             GPUComputePassEncoder.setBindGroup computePassEncoder 2
               readSphereInfoBindGroup
             case runType of
@@ -2278,6 +2384,16 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
               SlowRun -> sphereHitScatteredPipeline
               BounceRun -> sphereHitScatteredPipeline
             GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
+          -- diffusify
+          GPUComputePassEncoder.setBindGroup computePassEncoder 0
+            canvasInfoBindGroup
+          GPUComputePassEncoder.setBindGroup computePassEncoder 1
+            rRawColorBindGroup
+          GPUComputePassEncoder.setBindGroup computePassEncoder 2
+            wRawDiffusedColorBuffer
+          GPUComputePassEncoder.setPipeline computePassEncoder
+            diffusifyPipeline
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupX workgroupY 1
           -----------------------
           -- merge anti-alias passes
           GPUComputePassEncoder.setBindGroup computePassEncoder 0
