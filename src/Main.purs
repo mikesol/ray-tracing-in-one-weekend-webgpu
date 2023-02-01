@@ -82,7 +82,7 @@ import Web.GPU.Internal.RequiredAndOptional (x)
 import Web.GPU.Navigator (gpu)
 import Web.HTML (HTMLCanvasElement, window)
 import Web.HTML.HTMLCanvasElement (height, setHeight, setWidth, toElement, width)
-import Web.HTML.Window (navigator)
+import Web.HTML.Window (navigator, requestAnimationFrame)
 import Web.Promise as Web.Promise
 
 kernelX :: Int
@@ -465,8 +465,8 @@ type MainComputeInfo =
   , usesContrast :: Boolean
   )
 
-partitionInitialRaysAndXYZs :: { z :: Int } -> String
-partitionInitialRaysAndXYZs { z } =
+partitionInitialRaysAndXYZs :: String
+partitionInitialRaysAndXYZs =
   fold
     [ """
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
@@ -495,9 +495,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   r.origin = origin;
   r.direction = vec3(-rendering_info.ambitus_x / 2.0, -rendering_info.ambitus_y / 2.0, -1.0) + vec3(px * rendering_info.ambitus_x, py * rendering_info.ambitus_y, 0.0);
   rays[lookup] = r;
-  xyzs[lookup] = vec3<u32>(current_grid_x, current_grid_y, """
-    , show z
-    , """u);
+  xyzs[lookup] = vec3<u32>(current_grid_x, current_grid_y, 0u);
   ixs[lookup] = lookup;
   var ac: aliased_color;
   ac.r0 = 1.f;
@@ -1110,8 +1108,8 @@ makeSkyHitStage device shaderRun = do
     , entryPoint: "main"
     }
 
-makeInitialPartitionStage :: GPUDevice -> Int -> Effect GPUProgrammableStage
-makeInitialPartitionStage device z = do
+makeInitialPartitionStage :: GPUDevice -> Effect GPUProgrammableStage
+makeInitialPartitionStage device = do
   let
     partitionInitialRaysAndXYZsDesc = x
       { code:
@@ -1122,7 +1120,7 @@ makeInitialPartitionStage device z = do
             , aliasedColor
             , yAxisStride
             , usefulConsts
-            , partitionInitialRaysAndXYZs { z }
+            , partitionInitialRaysAndXYZs
             ]
       }
   partitionInitialRaysAndXYZsModule <- createShaderModule device partitionInitialRaysAndXYZsDesc
@@ -1131,13 +1129,13 @@ makeInitialPartitionStage device z = do
     , entryPoint: "main"
     }
 
-makeInitialPartitionPipeline :: GPUPipelineLayout -> GPUDevice -> Int -> Effect GPUComputePipeline
-makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device z = do
-  partitionInitialRaysAndXYZsStage <- makeInitialPartitionStage device z
+makeInitialPartitionPipeline :: GPUPipelineLayout -> GPUDevice -> Effect GPUComputePipeline
+makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device = do
+  partitionInitialRaysAndXYZsStage <- makeInitialPartitionStage device
   partitionInitialRaysAndXYZsPipeline <- createComputePipeline device $ x
     { layout: partitionInitialRaysAndXYZsBindGroupLayout
     , compute: partitionInitialRaysAndXYZsStage
-    , label: "partitionInitialRaysAndXYZsPipeline" <> show z
+    , label: "partitionInitialRaysAndXYZsPipeline"
     }
   pure partitionInitialRaysAndXYZsPipeline
 
@@ -1409,7 +1407,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
         }
       seed <- randomInt 42 42424242
-      randos <- sequence $ replicate 0 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
+      randos <- sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
       let
         spheres =
           cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -2061,6 +2059,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , compute: resetThirdIndirectBufferStage
         , label: "resetThirdIndirectBufferPipeline"
         }
+      partitionInitialRaysAndXYZsPipeline <- makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device
       bvhQuickStage <- makeBVHStage device QuickBVH
       bvhQuickPipeline <- createComputePipeline device $ x
         { layout: quickBvhPipelineLayout
@@ -2122,7 +2121,6 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           , alphaMode: opaque
           }
       configure context config
-      partitionPipelines <- (0 .. 4) # traverse (makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device)
       -- loopN <- Ref.new 0
       let
         encodeCommands colorTexture = do
@@ -2186,101 +2184,100 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           GPUComputePassEncoder.setBindGroup computePassEncoder 1
             wCanvasBindGroup
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupOvershootX workgroupOvershootY 1
-          foreachE (A.take 1 partitionPipelines) \partitionInitialRaysAndXYZsPipeline -> do
-            -- set reader for all computations
-            GPUComputePassEncoder.setBindGroup computePassEncoder 0
-              readerBindGroup
+          -- set reader for all computations
+          GPUComputePassEncoder.setBindGroup computePassEncoder 0
+            readerBindGroup
+          GPUComputePassEncoder.setBindGroup computePassEncoder 2
+            debugBindGroup
+          -----------------------
+          -- set ray & xyz buffer
+          -- debugged
+          GPUComputePassEncoder.setBindGroup computePassEncoder 1
+            wInitialPartitionsEvenBindGroup
+          GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
+          GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
+          foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 1  BounceRun)) \(Tuple idx runType) -> do
+            -----------------------
+            -- set indirect buffer
+            when (runType /= QuickRun) do
+              GPUComputePassEncoder.setBindGroup computePassEncoder 0
+                readerBindGroup
+
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              wIndirectBufferBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wBvhInfoBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 3
+              debugBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+              QuickRun -> resetFirstIndirectBufferPipeline
+              SlowRun -> resetSecondIndirectBufferPipeline
+              BounceRun -> resetThirdIndirectBufferPipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+            -----------------------
+            -- do bvh
             GPUComputePassEncoder.setBindGroup computePassEncoder 2
               debugBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1 $ case runType of
+              QuickRun -> quickBvhBindGroup
+              SlowRun -> slowBvhBindGroup
+              BounceRun -> case idx `mod` 2 of
+                0 -> bounceBvhOddBindGroup
+                _ -> bounceBvhEvenBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+              QuickRun -> bvhQuickPipeline
+              SlowRun -> bvhSlowPipeline
+              BounceRun -> bvhBouncePipeline
+            GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder indirectBuffer 0
             -----------------------
-            -- set ray & xyz buffer
-            -- debugged
+            -- assemble coloring info
+            GPUComputePassEncoder.setBindGroup computePassEncoder 0
+              rBVHInfoBindGroup
             GPUComputePassEncoder.setBindGroup computePassEncoder 1
-              wInitialPartitionsEvenBindGroup
-            GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
-            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-            foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 0 BounceRun)) \(Tuple idx runType) -> do
-              -----------------------
-              -- set indirect buffer
-              when (runType /= QuickRun) do
-                GPUComputePassEncoder.setBindGroup computePassEncoder 0
-                  readerBindGroup
-
-              GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                wIndirectBufferBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                wBvhInfoBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 3
-                debugBindGroup
-              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-                QuickRun -> resetFirstIndirectBufferPipeline
-                SlowRun -> resetSecondIndirectBufferPipeline
-                BounceRun -> resetThirdIndirectBufferPipeline
-              GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
-              -----------------------
-              -- do bvh
-              GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                debugBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 1 $ case runType of
-                QuickRun -> quickBvhBindGroup
-                SlowRun -> slowBvhBindGroup
-                BounceRun -> case idx `mod` 2 of
-                  0 -> bounceBvhOddBindGroup
-                  _ -> bounceBvhEvenBindGroup
-              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-                QuickRun -> bvhQuickPipeline
-                SlowRun -> bvhSlowPipeline
-                BounceRun -> bvhBouncePipeline
-              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder indirectBuffer 0
-              -----------------------
-              -- assemble coloring info
-              GPUComputePassEncoder.setBindGroup computePassEncoder 0
-                rBVHInfoBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                wSkyHitIndirectBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                wSphereHitIndirectBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 3
-                debugBindGroup
-              GPUComputePassEncoder.setPipeline computePassEncoder
-                assembleSkyAndSphereHitPipeline
-              GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
-              -----------------------
-              -- reader for all shading
-              GPUComputePassEncoder.setBindGroup computePassEncoder 0 $ case runType of
-                QuickRun -> shaderReaderEvenBindGroup
-                SlowRun -> shaderReaderEvenBindGroup
-                -- bounces need to start with the odd bind group
-                -- because our first pass is actually two passes, quick bvh then slow
-                BounceRun -> case idx `mod` 2 of
-                  0 -> shaderReaderOddBindGroup
-                  _ -> shaderReaderEvenBindGroup
-              GPUComputePassEncoder.setBindGroup computePassEncoder 1
-                wRawColorBindGroup
-              -----------------------
-              -- color sky
-              GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                readSkyInfoBindGroup
-              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-                QuickRun -> skyHitBatchedPipeline
-                SlowRun -> skyHitScatteredPipeline
-                BounceRun -> skyHitScatteredPipeline
-              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
-              -- color spheres
-              GPUComputePassEncoder.setBindGroup computePassEncoder 2
-                readSphereInfoBindGroup
-              case runType of
-                QuickRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
-                SlowRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
-                -- on stage 2 (the first bounce stage, we are writing to even)
-                BounceRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 $ case idx `mod` 2 of
-                  0 -> shaderWriterEvenBindGroup
-                  _ -> shaderWriterOddBindGroup
-              GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
-                QuickRun -> sphereHitBatchedPipeline
-                SlowRun -> sphereHitScatteredPipeline
-                BounceRun -> sphereHitScatteredPipeline
-              GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
+              wSkyHitIndirectBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              wSphereHitIndirectBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 3
+              debugBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder
+              assembleSkyAndSphereHitPipeline
+            GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
+            -----------------------
+            -- reader for all shading
+            GPUComputePassEncoder.setBindGroup computePassEncoder 0 $ case runType of
+              QuickRun -> shaderReaderEvenBindGroup
+              SlowRun -> shaderReaderEvenBindGroup
+              -- bounces need to start with the odd bind group
+              -- because our first pass is actually two passes, quick bvh then slow
+              BounceRun -> case idx `mod` 2 of
+                0 -> shaderReaderOddBindGroup
+                _ -> shaderReaderEvenBindGroup
+            GPUComputePassEncoder.setBindGroup computePassEncoder 1
+              wRawColorBindGroup
+            -----------------------
+            -- color sky
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              readSkyInfoBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+              QuickRun -> skyHitBatchedPipeline
+              SlowRun -> skyHitScatteredPipeline
+              BounceRun -> skyHitScatteredPipeline
+            GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
+            -- color spheres
+            GPUComputePassEncoder.setBindGroup computePassEncoder 2
+              readSphereInfoBindGroup
+            case runType of
+              QuickRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
+              SlowRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 shaderWriterOddBindGroup
+              -- on stage 2 (the first bounce stage, we are writing to even)
+              BounceRun -> GPUComputePassEncoder.setBindGroup computePassEncoder 3 $ case idx `mod` 2 of
+                0 -> shaderWriterEvenBindGroup
+                _ -> shaderWriterOddBindGroup
+            GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
+              QuickRun -> sphereHitBatchedPipeline
+              SlowRun -> sphereHitScatteredPipeline
+              BounceRun -> sphereHitScatteredPipeline
+            GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
           -----------------------
           -- merge anti-alias passes
           GPUComputePassEncoder.setBindGroup computePassEncoder 0
@@ -2303,7 +2300,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
           toSubmit <- finish commandEncoder
           submit queue [ toSubmit ]
-          let debugCondition = true -- whichLoop == 100
+          let debugCondition = false -- whichLoop == 100
           launchAff_ do
             toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
             liftEffect do
@@ -2325,7 +2322,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           setHeight (floor ch) canvas
           colorTexture <- getCurrentTexture context
           encodeCommands colorTexture
-      -- window >>= void <<< requestAnimationFrame (f unit)
+          window >>= void <<< requestAnimationFrame (f unit)
 
       liftEffect render
 
