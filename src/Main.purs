@@ -576,7 +576,7 @@ setThirdIndirectBuffer =
 @compute @workgroup_size(1, 1, 1)
 fn main() {
   debug[0] = f32(bvh_info.n_next_bounce);
-  var total_dispatches = bvh_info.n_next_bounce / 16;
+  var total_dispatches = bvh_info.n_next_bounce / 64u; // 16;
   var xv = total_dispatches / y_axis_stride;
   indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
   indirection.y = 4u;
@@ -1161,10 +1161,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
 
         // sphere
         var ixv = ixvols[ii];
-        var ix = ixv.my_ix;
-        var sloc = ixv.vol;
         var r = rays[ixv.ix];
-        var node = bvh_nodes[sloc];
+        var node = bvh_nodes[ixv.vol];
         var hit_t: f32;
         var sphere_test = node.left * 4u;
         var sphere_hit = hit_sphere(
@@ -1177,7 +1175,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
           t_max,
           &hit_t);
         var i_plus_1 = node.left + 1u;
-        _ = atomicMin(&hits[my_ix], pack2x16float(vec2(f32(i_plus_1) + 0.02, hit_t)));
+        _ = atomicMin(&hits[ixv.my_ix], pack2x16float(vec2(f32(i_plus_1) + 0.02, hit_t)));
     }
   }
   workgroupBarrier();
@@ -2477,7 +2475,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           setHeight (floor ch) canvas
           colorTexture <- getCurrentTexture context
           encodeCommands colorTexture
-          window >>= void <<< requestAnimationFrame (f unit)
+          --window >>= void <<< requestAnimationFrame (f unit)
 
       liftEffect render
 
