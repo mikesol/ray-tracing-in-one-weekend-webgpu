@@ -778,7 +778,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   , """
   var rec: hit_record;
   _ = make_hit_rec(h0, h1, h2, h3, norm_t, &r, &rec);
-  var color = hit_color(&r, &rec);
+  var color = vec3(0.2,0.6,0.7);//hit_color(&r, &rec);
   ////////////////////////
   // bounce!
   var tgt = rec.p + rec.normal + random_in_unit_sphere(vec2(rec.p.x, rec.p.y), vec2(rec.p.y, rec.p.z));
