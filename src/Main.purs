@@ -1407,7 +1407,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , usage: GPUBufferUsage.copyDst .|. GPUBufferUsage.mapRead
         }
       seed <- randomInt 42 42424242
-      randos <- sequence $ replicate 512 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (random <#> \n -> n * 16.0 - 8.0) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
+      randos <- sequence $ replicate 256 $ Sphere <$> ({ cx: _, cy: _, cz: _, radius: 0.125 } <$> (({ a: _, b: _ } <$> random <*> random) <#> \{ a, b } -> (1.5 + (a * 2.0)) * (if b < 0.5 then -1.0 else 1.0)) <*> (random <#> \n -> n * 3.0 + 0.25) <*> (random <#> \n -> n * 16.0 - 8.0))
       let
         spheres =
           cons' (Sphere { cx: 0.0, cy: 0.0, cz: -1.0, radius: 0.5 })
@@ -2173,7 +2173,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
           -- not necessary in the loop, but useful as a stress test for animating positions
           computePassEncoder <- beginComputePass commandEncoder (x {})
-            -- set reader for all computations
+          -- set reader for all computations
           GPUComputePassEncoder.setBindGroup computePassEncoder 0
             readerBindGroup
           GPUComputePassEncoder.setBindGroup computePassEncoder 2
@@ -2196,7 +2196,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             wInitialPartitionsEvenBindGroup
           GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-          foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 1  BounceRun)) \(Tuple idx runType) -> do
+          foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 1 BounceRun)) \(Tuple idx runType) -> do
             -----------------------
             -- set indirect buffer
             when (runType /= QuickRun) do
