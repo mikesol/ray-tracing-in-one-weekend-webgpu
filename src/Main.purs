@@ -176,6 +176,8 @@ struct non_atomic_counter_struct {
   y: u32,
   z: u32,
   secondary_write_index: u32,
+  primary_skipped_write_index: u32,
+  secondary_skipped_write_index: u32,
   total_readable: u32
 }
 
@@ -184,6 +186,8 @@ struct counter_struct {
   y: u32,
   z: u32,
   secondary_write_index: atomic<u32>,
+  primary_skipped_write_index: atomic<u32>,
+  secondary_skipped_write_index: atomic<u32>,
   total_readable: u32
 }
   """
@@ -1106,6 +1110,113 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 }
 """
   ]
+
+bvhComputeShaderSafe :: { even :: Boolean } -> String
+bvhComputeShaderSafe { even } = fold
+  [ """
+const t_min = 0.0001;
+const t_max = 10000.f;
+const buffer_upper_limit = 2048u * 1024u * 4u * 16u;
+const really_big_sphere = buffer_upper_limit / 16u;
+const really_big_bvh = buffer_upper_limit / 32u;
+
+@group(0) @binding(0) var<storage, read> bvh_nodes : array<bvh_node>;
+@group(0) @binding(1) var<storage, read> rays: array<ray>;
+@group(0) @binding(2) var<storage, read_write> spheres : array<pix_vol>;
+@group(0) @binding(3) var<storage, read_write> bvh0 : array<pix_vol>;
+@group(0) @binding(4) var<storage, read_write> bvh1 : array<pix_vol>;
+@group(1) @binding(0) var<storage, read_write> counter : counter_struct;
+@group(2) @binding(0) var<storage, read_write> debug : array<f32>;
+@compute @workgroup_size(1, 64, 1)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  var ix = global_id.x * 64u * 4u + global_id.y;
+  if (ix >= counter.total_readable) {
+    return;
+  }
+  var pv = """
+  , if even then "bvh0" else "bvh1"
+  , """[ix];
+  var ray = rays[pv.pix];
+  var node = bvh_nodes[pv.vol];
+  var bbox: aabb;
+  bvh_node_bounding_box(&node, &bbox);
+  var i_was_hit = aabb_hit(&bbox, &ray, t_min, t_max);
+  if (i_was_hit) {
+    var bvnl = bvh_nodes[node.left];
+    var bvnr = bvh_nodes[node.right];
+    if (bvnl.is_sphere == 1u && bvnr.is_sphere == 1u) {
+      var sphere_ix = atomicAdd(&counter.secondary_write_index, 2u);
+      if (sphere_ix >= really_big_sphere) { _ = atomicAdd(&counter.secondary_skipped_write_index, 2u); return; }
+      var to_writeL: pix_vol;
+      to_writeL.pix = pv.pix;
+      to_writeL.vol = node.left;
+      spheres[sphere_ix] = to_writeL;
+      var to_writeR: pix_vol;
+      to_writeR.pix = pv.pix;
+      to_writeR.vol = node.right;
+      spheres[sphere_ix + 1] = to_writeR;
+    } else if (bvnl.is_sphere == 0u && bvnr.is_sphere == 0u) {
+      var bvh_ix = atomicAdd(&counter.primary_write_index, 2u);
+      if (bvh_ix >= really_big_bvh) { _ = atomicAdd(&counter.primary_skipped_write_index, 2u); return; }
+      var to_writeL: pix_vol;
+      to_writeL.pix = pv.pix;
+      to_writeL.vol = node.left;
+      """
+  , if even then "bvh1" else "bvh0"
+  , """[bvh_ix] = to_writeL;
+      var to_writeR: pix_vol;
+      to_writeR.pix = pv.pix;
+      to_writeR.vol = node.right;
+      """
+  , if even then "bvh1" else "bvh0"
+  , """[bvh_ix + 1] = to_writeR;
+    } else if (bvnl.is_sphere == 1u && bvnr.is_sphere == 0u) {
+      var sphere_ix = atomicAdd(&counter.secondary_write_index, 1u);
+      if (sphere_ix < really_big_sphere) { 
+        var to_writeL: pix_vol;
+        to_writeL.pix = pv.pix;
+        to_writeL.vol = node.left;
+        spheres[sphere_ix] = to_writeL;
+      } else {
+        _ = atomicAdd(&counter.secondary_skipped_write_index, 1u);
+      }
+      var bvh_ix = atomicAdd(&counter.primary_write_index, 1u);
+      if (bvh_ix < really_big_bvh) { 
+        var to_writeR: pix_vol;
+        to_writeR.pix = pv.pix;
+        to_writeR.vol = node.right;
+      """
+  , if even then "bvh1" else "bvh0"
+  , """[bvh_ix] = to_writeR;
+      } else {
+        _ = atomicAdd(&counter.primary_skipped_write_index, 1u);
+      }
+    } else {
+      var bvh_ix = atomicAdd(&counter.primary_write_index, 1u);
+      if (bvh_ix < really_big_bvh) { 
+        var to_writeL: pix_vol;
+        to_writeL.pix = pv.pix;
+        to_writeL.vol = node.left;
+        """
+    , if even then "bvh1" else "bvh0"
+    , """[bvh_ix] = to_writeL;
+      } else {
+        _ = atomicAdd(&counter.primary_skipped_write_index, 1u);
+      }
+      var sphere_ix = atomicAdd(&counter.secondary_write_index, 1u);
+      if (sphere_ix < really_big_sphere) { 
+        var to_writeR: pix_vol;
+        to_writeR.pix = pv.pix;
+        to_writeR.vol = node.right;
+        spheres[sphere_ix] = to_writeR;
+      } else {
+        _ = atomicAdd(&counter.secondary_skipped_write_index, 1u);
+      }
+    }
+  }
+}
+"""
+  ]
 type NodeBounds =
   ( aabb_min_x :: Number
   , aabb_min_y :: Number
@@ -1443,7 +1554,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , counterDefs
               , ray
               , aabb
-              , bvhComputeShader { even: true }
+              , bvhComputeShaderSafe { even: true }
               ]
         , label: "bvhEven"
         }
@@ -1466,7 +1577,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
               , counterDefs
               , ray
               , aabb
-              , bvhComputeShader { even: false }
+              , bvhComputeShaderSafe { even: false }
               ]
         , label: "bvhOdd"
         }
@@ -1599,11 +1710,15 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   ib_0.primary_write_index = 0u;
   ib_0.secondary_write_index = 0u;
+  ib_0.primary_skipped_write_index = 0u;
+  ib_0.secondary_skipped_write_index = 0u;
   ib_0.y = 4u;
   ib_0.z = 1u;
   ib_0.total_readable = rendering_info.real_canvas_width * rendering_info.canvas_height;
   ib_1.primary_write_index = ((rendering_info.real_canvas_width * rendering_info.canvas_height) / (64 * 4)) + 1u;
   ib_1.secondary_write_index = 0u;
+  ib_1.primary_skipped_write_index = 0u;
+  ib_1.secondary_skipped_write_index = 0u;
   ib_1.y = 4u;
   ib_1.z = 1u;
   ib_1.total_readable = rendering_info.real_canvas_width * rendering_info.canvas_height;
@@ -1638,26 +1753,28 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(2) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  debug[0] = f32(next_indirect.total_readable);
-  debug[1] = f32(next_indirect.primary_write_index);
-  debug[2] = f32(next_indirect.y);
-  debug[3] = f32(next_indirect.z);
-  debug[4] = f32(next_indirect.secondary_write_index);
-  debug[5] = f32(next_counter.total_readable);
-  debug[6] = f32(next_counter.primary_write_index);
-  debug[7] = f32(next_counter.y);
-  debug[8] = f32(next_counter.z);
-  debug[9] = f32(next_counter.secondary_write_index);
-  if (next_indirect.primary_write_index > (134217728 / (4*2))) {
-    debug[10] = 55.f;
-  }
-  if (next_counter.primary_write_index > (134217728 / (4*2))) {
-    debug[11] = 83.f;
-  }
-  next_counter.total_readable = next_indirect.primary_write_index;
+  //debug[0] = f32(next_indirect.total_readable);
+  //debug[1] = f32(next_indirect.primary_write_index);
+  //debug[2] = f32(next_indirect.y);
+  //debug[3] = f32(next_indirect.z);
+  //debug[4] = f32(next_indirect.secondary_write_index);
+  //debug[5] = f32(next_counter.total_readable);
+  //debug[6] = f32(next_counter.primary_write_index);
+  //debug[7] = f32(next_counter.y);
+  //debug[8] = f32(next_counter.z);
+  //debug[9] = f32(next_counter.secondary_write_index);
+  //if (next_indirect.primary_write_index > (134217728 / (4*2))) {
+  //  debug[10] = 55.f;
+  //}
+  //if (next_counter.primary_write_index > (134217728 / (4*2))) {
+  //  debug[11] = 83.f;
+  //}
+  next_counter.total_readable = next_indirect.primary_write_index - next_indirect.primary_skipped_write_index;
   next_counter.primary_write_index = 0u;
+  next_counter.primary_skipped_write_index = 0u;
   next_counter.secondary_write_index = next_indirect.secondary_write_index;
-  next_indirect.primary_write_index = (next_indirect.primary_write_index / (64 * 4)) + 1; // + 1 could have more finesse for edge case of exact division
+  next_counter.secondary_skipped_write_index = next_indirect.secondary_skipped_write_index;
+  next_indirect.primary_write_index = ((next_indirect.primary_write_index - next_indirect.primary_skipped_write_index) / (64 * 4)) + 1; // + 1 could have more finesse for edge case of exact division
 }"""
               ]
         , label: "shiftIndirectBuffers"
@@ -1690,7 +1807,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> sphere_count : u32;
 @compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
-  sphere_count = max(ctr_1.secondary_write_index, ctr_2.secondary_write_index);
+  sphere_count = max(ctr_1.secondary_write_index - ctr_1.secondary_skipped_write_index, ctr_2.secondary_write_index - ctr_2.secondary_skipped_write_index);
   sphere_hit_indirect.primary_write_index = (sphere_count / (64 * 4)) + 1; // + 1 could have more finesse for edge case of exact division
   sphere_hit_indirect.y = 4u;
   sphere_hit_indirect.z = 1u;
