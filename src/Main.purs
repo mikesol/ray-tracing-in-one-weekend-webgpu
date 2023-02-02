@@ -288,7 +288,8 @@ ray =
   """// ray
 struct ray {
   origin: vec3<f32>,
-  direction: vec3<f32>
+  direction: vec3<f32>,
+  xyz: vec3<u32>
 }
 """
 
@@ -471,9 +472,8 @@ partitionInitialRaysAndXYZs =
     [ """
 @group(0) @binding(0) var<storage, read> rendering_info : rendering_info_struct;
 @group(1) @binding(0) var<storage, read_write> rays : array<ray>;
-@group(1) @binding(1) var<storage, read_write> xyzs : array<vec3<u32>>;
-@group(1) @binding(2) var<storage, read_write> ixs : array<u32>;
-@group(1) @binding(3) var<storage, read_write> raw_colors : array<aliased_color>;
+@group(1) @binding(1) var<storage, read_write> ixs : array<u32>;
+@group(1) @binding(2) var<storage, read_write> raw_colors : array<aliased_color>;
 //@group(2) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 64, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
@@ -494,8 +494,8 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
   var r: ray;
   r.origin = origin;
   r.direction = vec3(-rendering_info.ambitus_x / 2.0, -rendering_info.ambitus_y / 2.0, -1.0) + vec3(px * rendering_info.ambitus_x, py * rendering_info.ambitus_y, 0.0);
+  r.xyz = vec3<u32>(current_grid_x, current_grid_y, 0u);
   rays[lookup] = r;
-  xyzs[lookup] = vec3<u32>(current_grid_x, current_grid_y, 0u);
   ixs[lookup] = lookup;
   var ac: aliased_color;
   ac.r0 = 1.f;
@@ -575,10 +575,10 @@ setThirdIndirectBuffer =
 @group(3) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 1, 1)
 fn main() {
-  debug[0] = f32(bvh_info.n_next_bounce);
+  //debug[0] = f32(bvh_info.n_next_bounce);
   var total_dispatches = bvh_info.n_next_bounce / 16u;
   var xv = total_dispatches / y_axis_stride;
-  indirection.x = 1u; //select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
+  indirection.x = select(xv + 1, xv, (xv * y_axis_stride) == total_dispatches);
   indirection.y = 4u;
   indirection.z = 1u;
   bvh_info.n_total = bvh_info.n_next_bounce;
@@ -612,12 +612,11 @@ fn main() {
 
 data ShaderRun = BatchedHits | ScatteredHits
 
-skyHitShader :: { shaderRun :: ShaderRun } -> String
+skyHitShader :: { shaderRun :: ShaderRun, debug :: Boolean } -> String
 skyHitShader { shaderRun } = fold
   [ """
 @group(0) @binding(0) var<storage, read_write> bvh_info : bvh_info_non_atomic;
 @group(0) @binding(1) var<storage, read> rays : array<ray>;
-@group(0) @binding(2) var<storage, read> xyzs : array<vec3<u32>>;
 @group(1) @binding(0) var<storage, read_write> colors : array<aliased_color>;
 @group(2) @binding(0) var<storage, read> sky_hits : array<sky_hit_info>;
 @group(3) @binding(0) var<storage, read_write> debug : array<f32>;
@@ -634,13 +633,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var sky_hit = sky_hits[ix / 64];
   var real_ix = sky_hit.ix + local_id.y;
   var ray = rays[real_ix];
-  var xyz = xyzs[real_ix];
+  var xyz = ray.xyz;
   """
       ScatteredHits ->
         """
   var sky_hit = sky_hits[ix];
   var ray = rays[sky_hit.ix];
-  var xyz = xyzs[sky_hit.ix];
+  var xyz = ray.xyz;
     """
   , """
   
@@ -678,20 +677,19 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   """
   ]
 
-sphereHitShader :: { shaderRun :: ShaderRun } -> String
-sphereHitShader { shaderRun } = fold
+sphereHitShader :: { shaderRun :: ShaderRun, debug :: Boolean } -> String
+sphereHitShader { shaderRun, debug } = fold
   [ """
 const t_min = 0.0001;
 const t_max = 10000.f;
 
 @group(0) @binding(0) var<storage, read_write> bvh_info : bvh_info_semi_atomic;
 @group(0) @binding(1) var<storage, read> rays : array<ray>;
-@group(0) @binding(2) var<storage, read> xyzs : array<vec3<u32>>;
 @group(1) @binding(0) var<storage, read_write> colors : array<aliased_color>;
 @group(2) @binding(0) var<storage, read> sphere_info : array<f32>;
 @group(2) @binding(1) var<storage, read> sphere_hits : array<sphere_hit_info>;
 @group(3) @binding(0) var<storage, read_write> rays_write : array<ray>;
-@group(3) @binding(1) var<storage, read_write> xyzs_write : array<vec3<u32>>;
+@group(3) @binding(1) var<storage, read_write> debug : array<f32>;
     """
   , """
 @compute @workgroup_size(1, 64, 1)
@@ -707,13 +705,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var sphere_hit = sphere_hits[ix / 64];
   var real_ix = sphere_hit.ix + local_id.y;
   var r = rays[real_ix];
-  var xyz = xyzs[real_ix];
+  var xyz = r.xyz;
   """
       ScatteredHits ->
         """
   var sphere_hit = sphere_hits[ix];
   var r = rays[sphere_hit.ix];
-  var xyz = xyzs[sphere_hit.ix];
+  var xyz = r.xyz;
     """
   , """
   var sphere_offset = sphere_hit.sphere_ix * 4;
@@ -751,9 +749,12 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var out_ray: ray;
   out_ray.origin = rec.p;
   out_ray.direction = tgt - rec.p;
+  out_ray.xyz = xyz;
   var new_ix = atomicAdd(&bvh_info.n_next_bounce, 1u);
   rays_write[new_ix] = out_ray;
-  xyzs_write[new_ix] = xyz;
+  """
+  , if debug then "debug[4+new_ix*2] = f32(xyz.x);debug[4+new_ix*2+1] = f32(xyz.y);" else ""
+  , """
   ///////////////////////
   // end bounce
   var adjusted_ix = bvh_info.real_canvas_width * xyz.y + xyz.x;
@@ -1050,7 +1051,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
 """
   ]
 
-bvhComputeBounce ::  String
+bvhComputeBounce :: String
 bvhComputeBounce = fold
   [ """
 // main
@@ -1075,6 +1076,7 @@ const t_max = 10000.f;
 @group(1) @binding(1) var<storage, read_write> bvh_info: bvh_info_atomic;
 @group(1) @binding(2) var<storage, read_write> sphere_hit : array<sphere_hit_info>;
 @group(1) @binding(3) var<storage, read_write> sky_hit : array<sky_hit_info>;
+@group(2) @binding(0) var<storage, read_write> debug : array<f32>;
 @compute @workgroup_size(1, 64, 1)
 fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_invocation_id) local_id : vec3<u32>) {
   ////////////////////////////////////////
@@ -1083,10 +1085,13 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   var ix: u32;
   var my_ix = atomicAdd(&bvh_ix, 1u);
   var go_cond = lookup < bvh_info.n_total;
-  for (var ii = local_id.y; ii < 1024u; ii += 16) {
+  for (var ii = local_id.y; ii < 1024u; ii += 64) {
     atomicStore(&hits[ii], bigggg);
   }
   var lookup_catapulted = (lookup / 64u) * 64u * 16u;
+  if (lookup_catapulted + my_ix == 0u) {
+    debug[0] = f32(rays[0].xyz.x);debug[1] = f32(rays[0].xyz.y);
+  }
   if (go_cond) {
     loop {
       // the data is unsorted, so we need to lookup the correct index
@@ -1155,7 +1160,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   workgroupBarrier();
   var ns = atomicLoad(&n_spheres);
   if (go_cond) {
-    for (var ii = local_id.y; ii < 4096u; ii += 16u) {
+    for (var ii = local_id.y; ii < 4096u; ii += 64) {
       if (ii >= ns) { break; }
 
         // sphere
@@ -1179,22 +1184,26 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>, @builtin(local_inv
   }
   workgroupBarrier();
   if (go_cond) {
-    for (var ii = local_id.y; ii < 1024u; ii += 16u) {
+    for (var ii = local_id.y; ii < 1024u; ii += 64) {
+      if (ii == 0u) {
+    debug[2] = f32(rays[ii].xyz.x);
+  }
         var unload = atomicLoad(&hits[ii]);
         var unpack = unpack2x16float(unload);
         var hit = unpack.y;
         var sphere_ix = u32(unpack.x);
         var ix = lookup_catapulted + ii;
         var i_was_hit  = sphere_ix > 0u;
+        
         if (i_was_hit) {
-          var i = atomicAdd(&bvh_info.n_hits, 1u);
+          var i = atomicAdd(&bvh_info.n_hits, 1u);debug[3] = f32(i);
           var hit_info: sphere_hit_info;
           hit_info.t = hit;
           hit_info.sphere_ix = sphere_ix - 1;
           hit_info.ix = ix;
           sphere_hit[i] = hit_info;
         } else {
-          var i = atomicAdd(&bvh_info.n_misses, 1u);
+          var i = atomicAdd(&bvh_info.n_misses, 1u);debug[3] = f32(i);
           var hit_info: sky_hit_info;
           hit_info.ix = ix;
           sky_hit[i] = hit_info;
@@ -1222,9 +1231,9 @@ makeBVHStage device bvhRun = do
             , aabb
             , hitSphere
             , case bvhRun of
-                    QuickBVH -> bvhComputeBody { bvhRun: QuickBVH' }
-                    SlowBVH -> bvhComputeBody { bvhRun: SlowBVH' }
-                    BounceBVH -> bvhComputeBounce
+                QuickBVH -> bvhComputeBody { bvhRun: QuickBVH' }
+                SlowBVH -> bvhComputeBody { bvhRun: SlowBVH' }
+                BounceBVH -> bvhComputeBounce
             ]
       }
   bvhModule <- createShaderModule device bvhDesc
@@ -1233,8 +1242,8 @@ makeBVHStage device bvhRun = do
     , entryPoint: "main"
     }
 
-makeSkyHitStage :: GPUDevice -> ShaderRun -> Effect GPUProgrammableStage
-makeSkyHitStage device shaderRun = do
+makeSkyHitStage :: GPUDevice -> ShaderRun -> Boolean -> Effect GPUProgrammableStage
+makeSkyHitStage device shaderRun debug = do
   let
     skyHitDesc = x
       { code:
@@ -1251,7 +1260,7 @@ makeSkyHitStage device shaderRun = do
             , hitRecord
             , calcColors
             , aliasedColor
-            , skyHitShader { shaderRun }
+            , skyHitShader { shaderRun, debug }
             ]
       }
   skyHitModule <- createShaderModule device skyHitDesc
@@ -1291,8 +1300,8 @@ makeInitialPartitionPipeline partitionInitialRaysAndXYZsBindGroupLayout device =
     }
   pure partitionInitialRaysAndXYZsPipeline
 
-makeSphereHitStage :: GPUDevice -> ShaderRun -> Effect GPUProgrammableStage
-makeSphereHitStage device shaderRun = do
+makeSphereHitStage :: GPUDevice -> ShaderRun -> Boolean -> Effect GPUProgrammableStage
+makeSphereHitStage device shaderRun debug = do
   let
     sphereHitDesc = x
       { code:
@@ -1313,7 +1322,7 @@ makeSphereHitStage device shaderRun = do
             , hitSphere
             , pointAtParameter
             , pseudoRandom
-            , sphereHitShader { shaderRun }
+            , sphereHitShader { shaderRun, debug }
             ]
       }
   sphereHitModule <- createShaderModule device sphereHitDesc
@@ -1584,15 +1593,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         { size: deviceLimits.maxStorageBufferBindingSize / 16
         , usage: GPUBufferUsage.storage
         }
-      xyzEvenBuffer <- createBuffer device $ x
-        { size: deviceLimits.maxStorageBufferBindingSize / 4
-        , usage: GPUBufferUsage.storage
-        }
       rayEvenBuffer <- createBuffer device $ x
-        { size: deviceLimits.maxStorageBufferBindingSize / 4
-        , usage: GPUBufferUsage.storage
-        }
-      xyzOddBuffer <- createBuffer device $ x
         { size: deviceLimits.maxStorageBufferBindingSize / 4
         , usage: GPUBufferUsage.storage
         }
@@ -1847,6 +1848,15 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
                   )
             , label: "w1r2BindGroupLayout"
             }
+      w1r1BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries:
+                (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
+                  ( x { type: if j == 0 then GPUBufferBindingType.storage else GPUBufferBindingType.readOnlyStorage }
+                      :: GPUBufferBindingLayout
+                  )
+            , label: "w1r1BindGroupLayout"
+            }
       wBindGroupLayout <- createBindGroupLayout device
         $ x
             { entries:
@@ -1860,6 +1870,14 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
       w2BindGroupLayout <- createBindGroupLayout device
         $ x
             { entries: (0 .. 1) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
+                ( x { type: GPUBufferBindingType.storage }
+                    :: GPUBufferBindingLayout
+                )
+            , label: "w2BindGroupLayout"
+            }
+      w3BindGroupLayout <- createBindGroupLayout device
+        $ x
+            { entries: (0 .. 2) <#> \j -> gpuBindGroupLayoutEntry j GPUShaderStage.compute
                 ( x { type: GPUBufferBindingType.storage }
                     :: GPUBufferBindingLayout
                 )
@@ -1938,7 +1956,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , label: "skyAndSpherePipelineLayout"
         }
       partitionInitialRaysAndXYZsBindGroupLayout <- createPipelineLayout device $ x
-        { bindGroupLayouts: [ readerBindGroupLayout, w4BindGroupLayout, debugBindGroupLayout ]
+        { bindGroupLayouts: [ readerBindGroupLayout, w3BindGroupLayout, debugBindGroupLayout ]
         , label: "partitionInitialRaysAndXYZsBindGroupLayout"
         }
       quickBvhPipelineLayout <- createPipelineLayout device $ x
@@ -1950,18 +1968,18 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , label: "slowBvhPipelineLayout"
         }
       bounceBvhPipelineLayout <- createPipelineLayout device $ x
-        { bindGroupLayouts: [ readerBindGroupLayout, bounceBvhBindGroupLayout ]
+        { bindGroupLayouts: [ readerBindGroupLayout, bounceBvhBindGroupLayout, debugBindGroupLayout ]
         , label: "bounceBvhPipelineLayout"
         }
       -- technically the sky shader doesn't need to write to bvh info as we're done with bounces
       -- but as changing it to read-only would require a layout switch we keep as write for now
       -- makes code easier to maintain
       skyShadingPipelineLayout <- createPipelineLayout device $ x
-        { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, rBindGroupLayout, debugBindGroupLayout ]
+        { bindGroupLayouts: [ w1r1BindGroupLayout, wBindGroupLayout, rBindGroupLayout, debugBindGroupLayout ]
         , label: "shadingPipelineLaout"
         }
       sphereShadingPipelineLayout <- createPipelineLayout device $ x
-        { bindGroupLayouts: [ w1r2BindGroupLayout, wBindGroupLayout, r2BindGroupLayout, w2BindGroupLayout ]
+        { bindGroupLayouts: [ w1r1BindGroupLayout, wBindGroupLayout, r2BindGroupLayout, w2BindGroupLayout ]
         , label: "sphereShadingPipelineLayout"
         }
       assembleRawColorsPipelineLayout <- createPipelineLayout device $ x
@@ -2013,26 +2031,22 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , label: "wRawColorBindGroup"
         }
       shaderReaderEvenBindGroup <- createBindGroup device $ x
-        { layout: w1r2BindGroupLayout
+        { layout: w1r1BindGroupLayout
         , entries:
             [ gpuBindGroupEntry 0
                 (x { buffer: bvhInfo } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
                 (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
-            , gpuBindGroupEntry 2
-                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
             ]
         , label: "shaderReaderEvenBindGroup"
         }
       shaderReaderOddBindGroup <- createBindGroup device $ x
-        { layout: w1r2BindGroupLayout
+        { layout: w1r1BindGroupLayout
         , entries:
             [ gpuBindGroupEntry 0
                 (x { buffer: bvhInfo } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
                 (x { buffer: rayOddBuffer } :: GPUBufferBinding)
-            , gpuBindGroupEntry 2
-                (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
             ]
         , label: "shaderReaderEvenBindGroup"
         }
@@ -2042,7 +2056,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             [ gpuBindGroupEntry 0
                 (x { buffer: rayOddBuffer } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
-                (x { buffer: xyzOddBuffer } :: GPUBufferBinding)
+                (x { buffer: debugBuffer } :: GPUBufferBinding)
             ]
         , label: "shaderWriterOddBindGroup"
         }
@@ -2052,20 +2066,18 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             [ gpuBindGroupEntry 0
                 (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
-                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
+                (x { buffer: debugBuffer } :: GPUBufferBinding)
             ]
         , label: "shaderWriterEvenBindGroup"
         }
       wInitialPartitionsEvenBindGroup <- createBindGroup device $ x
-        { layout: w4BindGroupLayout
+        { layout: w3BindGroupLayout
         , entries:
             [ gpuBindGroupEntry 0
                 (x { buffer: rayEvenBuffer } :: GPUBufferBinding)
             , gpuBindGroupEntry 1
-                (x { buffer: xyzEvenBuffer } :: GPUBufferBinding)
-            , gpuBindGroupEntry 2
                 (x { buffer: ixBuffer } :: GPUBufferBinding)
-            , gpuBindGroupEntry 3
+            , gpuBindGroupEntry 2
                 (x { buffer: rawColorBuffer } :: GPUBufferBinding)
             ]
         , label: "wInitialPartitionsBindGroup"
@@ -2235,29 +2247,41 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
         , compute: assembleSkyAndSphereHitStage
         , label: "assembleSkyAndSphereHitPipeline"
         }
-      skyHitBatchedStage <- makeSkyHitStage device BatchedHits
+      skyHitBatchedStage <- makeSkyHitStage device BatchedHits false
       skyHitBatchedPipeline <- createComputePipeline device $ x
         { layout: skyShadingPipelineLayout
         , compute: skyHitBatchedStage
         , label: "skyHitBatchedPipeline"
         }
-      skyHitScatteredStage <- makeSkyHitStage device ScatteredHits
-      skyHitScatteredPipeline <- createComputePipeline device $ x
+      skyHitScatteredSlowStage <- makeSkyHitStage device ScatteredHits false
+      skyHitScatteredSlowPipeline <- createComputePipeline device $ x
         { layout: skyShadingPipelineLayout
-        , compute: skyHitScatteredStage
-        , label: "skyHitScatteredPipeline"
+        , compute: skyHitScatteredSlowStage
+        , label: "skyHitScatteredSlowPipeline"
         }
-      sphereHitBatchedStage <- makeSphereHitStage device BatchedHits
+      skyHitScatteredBounceStage <- makeSkyHitStage device ScatteredHits false
+      skyHitScatteredBouncePipeline <- createComputePipeline device $ x
+        { layout: skyShadingPipelineLayout
+        , compute: skyHitScatteredBounceStage
+        , label: "skyHitScatteredBouncePipeline"
+        }
+      sphereHitBatchedStage <- makeSphereHitStage device BatchedHits true
       sphereHitBatchedPipeline <- createComputePipeline device $ x
         { layout: sphereShadingPipelineLayout
         , compute: sphereHitBatchedStage
         , label: "sphereHitBatchedPipeline"
         }
-      sphereHitScatteredStage <- makeSphereHitStage device ScatteredHits
-      sphereHitScatteredPipeline <- createComputePipeline device $ x
+      sphereHitScatteredSlowStage <- makeSphereHitStage device ScatteredHits false
+      sphereHitScatteredSlowPipeline <- createComputePipeline device $ x
         { layout: sphereShadingPipelineLayout
-        , compute: sphereHitScatteredStage
-        , label: "sphereHitScatteredStage"
+        , compute: sphereHitScatteredSlowStage
+        , label: "sphereHitScatteredSlowStage"
+        }
+      sphereHitScatteredBounceStage <- makeSphereHitStage device ScatteredHits false
+      sphereHitScatteredBouncePipeline <- createComputePipeline device $ x
+        { layout: sphereShadingPipelineLayout
+        , compute: sphereHitScatteredBounceStage
+        , label: "sphereHitScatteredBouncePipeline"
         }
       assembleRawColorsPipeline <- createComputePipeline device $ x
         { layout: assembleRawColorsPipelineLayout
@@ -2325,7 +2349,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           writeBuffer queue canvasInfoBuffer 0 (fromUint32Array cinfo)
           -- not necessary in the loop, but useful as a stress test for animating positions
           computePassEncoder <- beginComputePass commandEncoder (x {})
-            -- set reader for all computations
+          -- set reader for all computations
           GPUComputePassEncoder.setBindGroup computePassEncoder 0
             readerBindGroup
           GPUComputePassEncoder.setBindGroup computePassEncoder 2
@@ -2348,7 +2372,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             wInitialPartitionsEvenBindGroup
           GPUComputePassEncoder.setPipeline computePassEncoder partitionInitialRaysAndXYZsPipeline
           GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder workgroupXForIndirectPartition 4 1
-          foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 1  BounceRun)) \(Tuple idx runType) -> do
+          foreachE (mapWithIndex Tuple ([ QuickRun, SlowRun ] <> replicate 1 BounceRun)) \(Tuple idx runType) -> do
             -----------------------
             -- set indirect buffer
             when (runType /= QuickRun) do
@@ -2364,7 +2388,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
             GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
               QuickRun -> resetFirstIndirectBufferPipeline
               SlowRun -> resetSecondIndirectBufferPipeline
-              BounceRun -> resetThirdIndirectBufferPipeline
+              BounceRun -> let _ = spy "foo" true in resetThirdIndirectBufferPipeline
             GPUComputePassEncoder.dispatchWorkgroupsXYZ computePassEncoder 1 1 1
             -----------------------
             -- do bvh
@@ -2412,8 +2436,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
               readSkyInfoBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
               QuickRun -> skyHitBatchedPipeline
-              SlowRun -> skyHitScatteredPipeline
-              BounceRun -> skyHitScatteredPipeline
+              SlowRun -> skyHitScatteredSlowPipeline
+              BounceRun -> skyHitScatteredBouncePipeline
             GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder skyHitIndirectBuffer 0
             -- color spheres
             GPUComputePassEncoder.setBindGroup computePassEncoder 2
@@ -2427,8 +2451,8 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
                 _ -> shaderWriterOddBindGroup
             GPUComputePassEncoder.setPipeline computePassEncoder $ case runType of
               QuickRun -> sphereHitBatchedPipeline
-              SlowRun -> sphereHitScatteredPipeline
-              BounceRun -> sphereHitScatteredPipeline
+              SlowRun -> sphereHitScatteredSlowPipeline
+              BounceRun -> sphereHitScatteredBouncePipeline
             GPUComputePassEncoder.dispatchWorkgroupsIndirect computePassEncoder sphereHitIndirectBuffer 0
           -----------------------
           -- merge anti-alias passes
@@ -2452,7 +2476,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           copyBufferToBuffer commandEncoder debugBuffer 0 debugOutputBuffer 0 65536
           toSubmit <- finish commandEncoder
           submit queue [ toSubmit ]
-          let debugCondition = false -- whichLoop == 100
+          let debugCondition = true -- whichLoop == 100
           launchAff_ do
             toAffE $ convertPromise <$> if debugCondition then mapAsync debugOutputBuffer GPUMapMode.read else onSubmittedWorkDone queue
             liftEffect do
@@ -2474,7 +2498,7 @@ gpuMe showErrorMessage pushFrameInfo canvas = launchAff_ $ delay (Milliseconds 2
           setHeight (floor ch) canvas
           colorTexture <- getCurrentTexture context
           encodeCommands colorTexture
-          --window >>= void <<< requestAnimationFrame (f unit)
+      --window >>= void <<< requestAnimationFrame (f unit)
 
       liftEffect render
 
